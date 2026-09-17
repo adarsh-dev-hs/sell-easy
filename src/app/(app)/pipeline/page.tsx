@@ -86,7 +86,7 @@ function Pipeline() {
   }
   const openDeal = (id: string) => setParam("deal", id)
 
-  const wonCount = stats?.byStage.find((s) => s.stage === "closed_won")?.count ?? 0
+  const dealCount = stats?.byStage.reduce((n, s) => n + s.count, 0) ?? 0
   const stat = (v: string | undefined) => v ?? <Skeleton className="h-8 w-24" />
 
   return (
@@ -140,7 +140,7 @@ function Pipeline() {
           label="Avg deal size"
           value={stat(stats && currency(stats.avgDealSize))}
           icon={KanbanSquareIcon}
-          hint={stats && `Across ${wonCount} won deals`}
+          hint={stats && `Across all ${dealCount} deals`}
         />
       </div>
 
