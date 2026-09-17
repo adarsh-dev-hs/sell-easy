@@ -1,0 +1,615 @@
+import { COUNTRIES, DEAL_STAGES, FUNDING_STAGES, INDUSTRIES, SIGNAL_SOURCES, TECHNOLOGIES } from "./constants"
+import { scoreAccount } from "./scoring"
+import type {
+  Account,
+  AccountStage,
+  Activity,
+  AgentRun,
+  ApiKey,
+  AppNotification,
+  Contact,
+  Deal,
+  DealStage,
+  Enrollment,
+  IcpConfig,
+  InboxMessage,
+  Integration,
+  Mailbox,
+  Organization,
+  OutreachDraft,
+  PlaybookRule,
+  Seniority,
+  Sequence,
+  Signal,
+  SignalType,
+  User,
+} from "./types"
+
+// Deterministic PRNG so the demo dataset is stable between resets.
+function mulberry32(seed: number) {
+  return () => {
+    seed |= 0
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+export interface SeedData {
+  org: Organization
+  currentUserId: string
+  users: User[]
+  apiKeys: ApiKey[]
+  accounts: Account[]
+  contacts: Contact[]
+  signals: Signal[]
+  icp: IcpConfig
+  rules: PlaybookRule[]
+  runs: AgentRun[]
+  drafts: OutreachDraft[]
+  sequences: Sequence[]
+  enrollments: Enrollment[]
+  mailboxes: Mailbox[]
+  inbox: InboxMessage[]
+  deals: Deal[]
+  activities: Activity[]
+  integrations: Integration[]
+  notifications: AppNotification[]
+}
+
+const COMPANY_PREFIX = [
+  "Nimbus", "Vertex", "Quantum", "Bright", "Atlas", "Nova", "Helix", "Summit", "Pioneer", "Lumen",
+  "Cobalt", "Orbit", "Stratus", "Beacon", "Evergreen", "Falcon", "Granite", "Horizon", "Ionic", "Juniper",
+  "Kinetic", "Lattice", "Meridian", "Northwind", "Onyx", "Polaris", "Quartz", "Redwood", "Sierra", "Tidal",
+]
+const COMPANY_SUFFIX = ["Labs", "Systems", "Health", "Pay", "Logistics", "AI", "Cloud", "Works", "Commerce", "Security"]
+const FIRST = [
+  "Ava", "Liam", "Noah", "Emma", "Olivia", "Mason", "Sophia", "Lucas", "Mia", "Ethan", "Isabella", "Aiden",
+  "Priya", "Arjun", "Chen", "Mei", "Diego", "Sofia", "Omar", "Layla", "Jonas", "Freya", "Kenji", "Aisha",
+]
+const LAST = [
+  "Carter", "Nguyen", "Patel", "Schmidt", "Rossi", "Kim", "Garcia", "Johnson", "Müller", "Singh", "Brown",
+  "Tanaka", "Silva", "Okafor", "Larsen", "Dubois", "Cohen", "Ali", "Walker", "Moreau",
+]
+const TITLES: { title: string; seniority: Seniority; department: string }[] = [
+  { title: "Chief Revenue Officer", seniority: "C-Level", department: "Sales" },
+  { title: "CEO", seniority: "C-Level", department: "Executive" },
+  { title: "VP of Sales", seniority: "VP", department: "Sales" },
+  { title: "VP Marketing", seniority: "VP", department: "Marketing" },
+  { title: "Director of RevOps", seniority: "Director", department: "Operations" },
+  { title: "Head of Growth", seniority: "Director", department: "Marketing" },
+  { title: "Sales Manager", seniority: "Manager", department: "Sales" },
+  { title: "Demand Gen Manager", seniority: "Manager", department: "Marketing" },
+  { title: "Account Executive", seniority: "IC", department: "Sales" },
+  { title: "SDR Lead", seniority: "Manager", department: "Sales" },
+]
+const CITIES: Record<string, string[]> = {
+  "United States": ["San Francisco", "New York", "Austin", "Boston", "Seattle"],
+  "United Kingdom": ["London", "Manchester"],
+  Germany: ["Berlin", "Munich"],
+  Canada: ["Toronto", "Vancouver"],
+  India: ["Bengaluru", "Chennai", "Mumbai"],
+  Australia: ["Sydney", "Melbourne"],
+  France: ["Paris", "Lyon"],
+  Netherlands: ["Amsterdam", "Rotterdam"],
+}
+
+const SIGNAL_TEMPLATES: Record<SignalType, { title: string; detail: string }[]> = {
+  intent_topic: [
+    { title: "Surging on “sales automation”", detail: "Topic score 78 across 12 researchers this week" },
+    { title: "Researching “intent data platforms”", detail: "3x baseline consumption on comparison content" },
+    { title: "Surging on “outbound prospecting”", detail: "Topic score 71, trending up 4 weeks" },
+  ],
+  website_visit: [
+    { title: "Visited pricing page", detail: "3 visitors, 7 pageviews, 4m 12s on pricing" },
+    { title: "Visited integrations page", detail: "Viewed HubSpot + Salesforce integration docs" },
+    { title: "Returned to case studies", detail: "2nd visit this week from identified person" },
+  ],
+  hiring: [
+    { title: "Hiring 4 SDRs", detail: "New job posts for Sales Development Representatives" },
+    { title: "Hiring Head of RevOps", detail: "Senior RevOps role posted on LinkedIn" },
+    { title: "Expanding sales team", detail: "11 open GTM roles, +60% vs last quarter" },
+  ],
+  funding: [
+    { title: "Raised Series B", detail: "$32M led by Accel" },
+    { title: "Raised Series A", detail: "$14M led by Index Ventures" },
+    { title: "Announced growth round", detail: "$55M to expand into EMEA" },
+  ],
+  job_change: [
+    { title: "New VP Sales joined", detail: "Previously a customer at a competitor account" },
+    { title: "Champion changed jobs", detail: "Former user of our product joined as Director of RevOps" },
+  ],
+  tech_install: [
+    { title: "Installed HubSpot", detail: "Detected HubSpot tracking script" },
+    { title: "Removed competitor tool", detail: "Competitor widget no longer detected" },
+  ],
+  social_engagement: [
+    { title: "Engaged with LinkedIn post", detail: "Commented on post about AI SDRs" },
+    { title: "Followed company page", detail: "2 employees followed our LinkedIn page" },
+  ],
+  news: [
+    { title: "Announced new product line", detail: "Press release mentions GTM expansion" },
+    { title: "Opened new office", detail: "Expanding to London with 50 hires" },
+  ],
+}
+
+const INTEGRATIONS: Omit<Integration, "connected" | "status" | "settings">[] = [
+  { id: "int_clearbit", name: "Clearbit", category: "enrichment", description: "Firmographic and technographic company enrichment.", feeds: "Entity service" },
+  { id: "int_apollo", name: "Apollo.io", category: "contacts", description: "B2B contact database and TAM sourcing API.", feeds: "Entity service" },
+  { id: "int_fullenrich", name: "FullEnrich", category: "enrichment", description: "Waterfall email & phone enrichment across 15+ providers.", feeds: "Entity service" },
+  { id: "int_prospeo", name: "Prospeo", category: "enrichment", description: "Email finder and verifier from LinkedIn URLs.", feeds: "Entity service" },
+  { id: "int_limadata", name: "Limadata", category: "contacts", description: "Real-time person and company data.", feeds: "Entity service" },
+  { id: "int_bombora", name: "Bombora", category: "intent", description: "Company surge intent data across B2B topics.", feeds: "Signal ingestion" },
+  { id: "int_rb2b", name: "RB2B", category: "intent", description: "Person-level website visitor identification.", feeds: "Signal ingestion" },
+  { id: "int_trigify", name: "Trigify.io", category: "intent", description: "Social engagement and job-change signals.", feeds: "Signal ingestion" },
+  { id: "int_apify", name: "Apify", category: "scraping", description: "Scrape job boards, websites and review sites.", feeds: "Entity service" },
+  { id: "int_linkup", name: "Linkup", category: "scraping", description: "Web search API for news and account research.", feeds: "Entity service" },
+  { id: "int_ses", name: "AWS SES", category: "email", description: "Transactional and outbound email sending.", feeds: "Outreach service" },
+  { id: "int_mailpool", name: "Mailpool", category: "email", description: "Managed inboxes with warm-up and deliverability.", feeds: "Outreach service" },
+  { id: "int_instantly", name: "Instantly.ai", category: "email", description: "Cold email infrastructure with warm-up network.", feeds: "Outreach service" },
+  { id: "int_heyreach", name: "HeyReach", category: "linkedin", description: "LinkedIn automation across multiple sender accounts.", feeds: "Outreach service" },
+  { id: "int_fireflies", name: "Fireflies.ai", category: "calls", description: "Call recording, transcription and insights.", feeds: "Analytics" },
+  { id: "int_hubspot", name: "HubSpot", category: "crm", description: "Bi-directional sync of companies, contacts and deals.", feeds: "CRM/Pipeline" },
+  { id: "int_attio", name: "Attio", category: "crm", description: "Sync records and lists with Attio.", feeds: "CRM/Pipeline" },
+  { id: "int_salesforce", name: "Salesforce", category: "crm", description: "Enterprise CRM sync for accounts, leads and opportunities.", feeds: "CRM/Pipeline" },
+  { id: "int_anthropic", name: "Anthropic (Claude)", category: "llm", description: "Powers agentic scoring, research and outreach drafting.", feeds: "Scoring + orchestration" },
+]
+
+export function defaultIcp(now: string): IcpConfig {
+  return {
+    industries: ["SaaS", "Fintech", "Cybersecurity", "E-commerce"],
+    countries: ["United States", "United Kingdom", "Canada", "Germany"],
+    employeeMin: 50,
+    employeeMax: 2000,
+    revenueMin: 5_000_000,
+    technologies: ["Salesforce", "HubSpot", "Snowflake", "Segment", "Outreach"],
+    fundingStages: ["Series A", "Series B", "Series C", "Series D+"],
+    fitWeight: 55,
+    signalWeights: {
+      intent_topic: 70,
+      website_visit: 90,
+      hiring: 60,
+      funding: 75,
+      job_change: 80,
+      tech_install: 45,
+      social_engagement: 35,
+      news: 30,
+    },
+    intentDecayDays: 14,
+    tierThresholds: { A: 70, B: 52, C: 35 },
+    updatedAt: now,
+  }
+}
+
+export function generateSeed(): SeedData {
+  const rand = mulberry32(42)
+  const pick = <T,>(arr: readonly T[]) => arr[Math.floor(rand() * arr.length)]
+  const int = (min: number, max: number) => Math.floor(rand() * (max - min + 1)) + min
+  const sample = <T,>(arr: readonly T[], n: number) => [...arr].sort(() => rand() - 0.5).slice(0, n)
+  const NOW = Date.now()
+  const ago = (days: number, hours = 0) => new Date(NOW - days * 86_400_000 - hours * 3_600_000).toISOString()
+  const ahead = (days: number) => new Date(NOW + days * 86_400_000).toISOString()
+
+  const org: Organization = {
+    id: "org_1",
+    name: "Acme Growth Inc.",
+    domain: "acmegrowth.com",
+    plan: "growth",
+    seats: 10,
+    timezone: "America/New_York",
+  }
+
+  const colors = ["bg-indigo-500", "bg-emerald-500", "bg-amber-500", "bg-rose-500", "bg-sky-500", "bg-violet-500"]
+  const users: User[] = [
+    { id: "usr_1", name: "Jordan Lee", email: "jordan@acmegrowth.com", role: "owner", title: "Head of Sales", avatarColor: colors[0], status: "active", lastActiveAt: ago(0) },
+    { id: "usr_2", name: "Sam Rivera", email: "sam@acmegrowth.com", role: "admin", title: "RevOps Lead", avatarColor: colors[1], status: "active", lastActiveAt: ago(0, 3) },
+    { id: "usr_3", name: "Taylor Brooks", email: "taylor@acmegrowth.com", role: "member", title: "Account Executive", avatarColor: colors[2], status: "active", lastActiveAt: ago(1) },
+    { id: "usr_4", name: "Casey Morgan", email: "casey@acmegrowth.com", role: "member", title: "SDR", avatarColor: colors[3], status: "active", lastActiveAt: ago(0, 6) },
+    { id: "usr_5", name: "Riley Chen", email: "riley@acmegrowth.com", role: "viewer", title: "Marketing Ops", avatarColor: colors[4], status: "active", lastActiveAt: ago(4) },
+    { id: "usr_6", name: "Alex Kim", email: "alex@acmegrowth.com", role: "member", title: "SDR", avatarColor: colors[5], status: "invited" },
+  ]
+  const sellers = ["usr_1", "usr_3", "usr_4"]
+
+  const apiKeys: ApiKey[] = [
+    { id: "key_1", name: "Production webhook ingest", prefix: "se_live_7Hk2", scopes: ["signals:write", "accounts:read"], createdAt: ago(60), lastUsedAt: ago(0, 1), createdBy: "usr_2", revoked: false },
+    { id: "key_2", name: "Data warehouse export", prefix: "se_live_Qp91", scopes: ["accounts:read", "pipeline:read"], createdAt: ago(30), lastUsedAt: ago(1), createdBy: "usr_1", revoked: false },
+    { id: "key_3", name: "Old Zapier key", prefix: "se_live_x0Aa", scopes: ["accounts:write"], createdAt: ago(200), lastUsedAt: ago(95), createdBy: "usr_1", revoked: true },
+  ]
+
+  const icp = defaultIcp(ago(10))
+
+  // ---- Accounts ----
+  const accounts: Account[] = []
+  const usedNames = new Set<string>()
+  const stages: AccountStage[] = ["new", "new", "researching", "researching", "engaged", "engaged", "opportunity", "customer", "disqualified"]
+  for (let i = 0; i < 64; i++) {
+    let name = ""
+    do name = `${pick(COMPANY_PREFIX)} ${pick(COMPANY_SUFFIX)}`
+    while (usedNames.has(name))
+    usedNames.add(name)
+    const country = pick(COUNTRIES)
+    const employees = pick([12, 35, 80, 150, 240, 420, 800, 1200, 2500, 6000]) + int(0, 30)
+    const industry = pick(INDUSTRIES)
+    const domain = `${name.toLowerCase().replace(/[^a-z]/g, "")}.com`
+    const created = int(5, 180)
+    accounts.push({
+      id: `acc_${i + 1}`,
+      name,
+      domain,
+      industry,
+      employees,
+      revenue: Math.round(employees * int(60, 260) * 1000),
+      country,
+      city: pick(CITIES[country]),
+      technologies: sample(TECHNOLOGIES, int(2, 6)),
+      fundingStage: pick(FUNDING_STAGES),
+      description: `${name} builds ${industry.toLowerCase()} software for mid-market and enterprise teams, helping them operate faster with better data.`,
+      linkedinUrl: `https://linkedin.com/company/${domain.replace(".com", "")}`,
+      ownerId: rand() > 0.15 ? pick(sellers) : null,
+      stage: pick(stages),
+      fitScore: 0,
+      intentScore: 0,
+      score: 0,
+      tier: "D",
+      scoreHistory: [],
+      enrichedAt: rand() > 0.2 ? ago(int(0, 30)) : undefined,
+      enrichmentSources: sample(["Clearbit", "Apollo.io", "FullEnrich", "Apify"], int(1, 3)),
+      versions: [
+        { version: 1, at: ago(created), source: "Apollo.io import", changes: [{ field: "record", from: "—", to: "created" }] },
+        { version: 2, at: ago(Math.max(0, created - 3)), source: "Clearbit enrichment", changes: [{ field: "employees", from: String(Math.round(employees * 0.9)), to: String(employees) }, { field: "industry", from: "Software", to: industry }] },
+      ],
+      tags: rand() > 0.6 ? sample(["Target 2026", "Competitor user", "Event lead", "Partner referral"], int(1, 2)) : [],
+      createdAt: ago(created),
+      updatedAt: ago(int(0, 5)),
+    })
+  }
+  // A couple of dedup candidates for the entity service
+  const dupSource = accounts[3]
+  accounts.push({
+    ...dupSource,
+    id: "acc_dup_1",
+    name: `${dupSource.name} Inc`,
+    domain: `www.${dupSource.domain}`,
+    ownerId: null,
+    stage: "new",
+    tags: [],
+    duplicateOf: dupSource.id,
+    versions: [{ version: 1, at: ago(2), source: "CSV upload", changes: [{ field: "record", from: "—", to: "created" }] }],
+    createdAt: ago(2),
+  })
+  const dupSource2 = accounts[10]
+  accounts.push({
+    ...dupSource2,
+    id: "acc_dup_2",
+    name: dupSource2.name.toUpperCase(),
+    ownerId: null,
+    stage: "new",
+    tags: [],
+    duplicateOf: dupSource2.id,
+    versions: [{ version: 1, at: ago(1), source: "HubSpot sync", changes: [{ field: "record", from: "—", to: "created" }] }],
+    createdAt: ago(1),
+  })
+
+  // ---- Contacts ----
+  const contacts: Contact[] = []
+  let cIdx = 0
+  for (const a of accounts) {
+    if (a.duplicateOf) continue
+    const n = int(2, 5)
+    for (const t of sample(TITLES, n)) {
+      const firstName = pick(FIRST)
+      const lastName = pick(LAST)
+      const statusRoll = rand()
+      contacts.push({
+        id: `con_${++cIdx}`,
+        accountId: a.id,
+        firstName,
+        lastName,
+        title: t.title,
+        seniority: t.seniority,
+        department: t.department,
+        email: `${firstName.toLowerCase()}.${lastName.toLowerCase().replace("ü", "u")}@${a.domain}`,
+        emailStatus: pick(["verified", "verified", "verified", "unverified", "missing", "invalid"] as const),
+        phone: rand() > 0.5 ? `+1 (${int(200, 999)}) ${int(200, 999)}-${int(1000, 9999)}` : undefined,
+        linkedinUrl: `https://linkedin.com/in/${firstName.toLowerCase()}-${lastName.toLowerCase()}-${int(10, 99)}`,
+        location: `${a.city}, ${a.country}`,
+        ownerId: a.ownerId,
+        status:
+          statusRoll > 0.9 ? "meeting" : statusRoll > 0.8 ? "replied" : statusRoll > 0.55 ? "in_sequence" : statusRoll > 0.52 ? "bounced" : statusRoll > 0.5 ? "unsubscribed" : "new",
+        lastContactedAt: statusRoll > 0.5 ? ago(int(0, 20)) : undefined,
+        createdAt: a.createdAt,
+      })
+    }
+  }
+
+  // ---- Signals ----
+  const signals: Signal[] = []
+  const types = Object.keys(SIGNAL_TEMPLATES) as SignalType[]
+  const realAccounts = accounts.filter((a) => !a.duplicateOf)
+  for (let i = 0; i < 260; i++) {
+    // Skew signals toward a subset of "hot" accounts
+    const a = rand() > 0.45 ? realAccounts[int(0, 14)] : pick(realAccounts)
+    const type = pick(types)
+    const tpl = pick(SIGNAL_TEMPLATES[type])
+    const accContacts = contacts.filter((c) => c.accountId === a.id)
+    const days = Math.floor(Math.pow(rand(), 1.8) * 45)
+    signals.push({
+      id: `sig_${i + 1}`,
+      type,
+      source: pick(SIGNAL_SOURCES[type]),
+      accountId: a.id,
+      contactId: ["website_visit", "job_change", "social_engagement"].includes(type) && accContacts.length ? pick(accContacts).id : undefined,
+      title: tpl.title,
+      detail: tpl.detail,
+      strength: int(35, 98),
+      occurredAt: ago(days, int(0, 23)),
+      processed: days > 0 || rand() > 0.3,
+    })
+  }
+  signals.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
+
+  // Score accounts and build a plausible history
+  for (const a of accounts) {
+    const s = scoreAccount(a, signals, icp)
+    Object.assign(a, { fitScore: s.fit, intentScore: s.intent, score: s.score, tier: s.tier })
+    a.scoreHistory = [5, 4, 3, 2, 1, 0].map((w) => {
+      const intent = Math.max(0, Math.round(s.intent - w * int(0, 6)))
+      const score = Math.round(s.fit * (icp.fitWeight / 100) + intent * (1 - icp.fitWeight / 100))
+      return { at: ago(w * 7), fit: s.fit, intent, score, reason: w === 0 ? "Latest signals processed" : "Weekly recompute" }
+    })
+  }
+
+  // ---- Playbook rules ----
+  const rules: PlaybookRule[] = [
+    { id: "rule_1", name: "Hot pricing-page visitors", description: "Tier A/B accounts visiting pricing get a personalized email draft and owner alert.", enabled: true, trigger: "website_visit", minScore: 55, tiers: ["A", "B"], actions: ["rescore", "route_owner", "draft_outreach", "notify"], sequenceId: "seq_1", requireApproval: true, runs: 48 },
+    { id: "rule_2", name: "Funding round follow-up", description: "Newly funded ICP accounts are enrolled in the funding sequence.", enabled: true, trigger: "funding", minScore: 45, tiers: ["A", "B", "C"], actions: ["rescore", "enrich", "enroll_sequence"], sequenceId: "seq_2", requireApproval: false, runs: 12 },
+    { id: "rule_3", name: "Champion job change", description: "When a past champion moves, draft a warm intro on LinkedIn.", enabled: true, trigger: "job_change", minScore: 0, tiers: ["A", "B", "C", "D"], actions: ["rescore", "draft_outreach", "notify"], sequenceId: "seq_3", requireApproval: true, runs: 9 },
+    { id: "rule_4", name: "Tier A surge → create deal", description: "High-intent tier A accounts get a discovery deal opened automatically.", enabled: true, trigger: "intent_topic", minScore: 70, tiers: ["A"], actions: ["rescore", "create_deal", "notify"], requireApproval: false, runs: 6 },
+    { id: "rule_5", name: "Hiring SDRs", description: "Accounts hiring SDRs are routed and enriched.", enabled: false, trigger: "hiring", minScore: 40, tiers: ["A", "B", "C"], actions: ["rescore", "enrich", "route_owner"], requireApproval: false, runs: 21 },
+  ]
+
+  // ---- Sequences & mailboxes ----
+  const mailboxes: Mailbox[] = [
+    { id: "mb_1", email: "jordan@try-acmegrowth.com", provider: "Mailpool", dailyLimit: 50, sentToday: 31, warmupEnabled: true, healthScore: 96, status: "healthy" },
+    { id: "mb_2", email: "casey@try-acmegrowth.com", provider: "Mailpool", dailyLimit: 50, sentToday: 44, warmupEnabled: true, healthScore: 91, status: "healthy" },
+    { id: "mb_3", email: "taylor@acmegrowth.io", provider: "Google", dailyLimit: 40, sentToday: 12, warmupEnabled: true, healthScore: 74, status: "warning" },
+    { id: "mb_4", email: "outbound@mail.acmegrowth.com", provider: "SES", dailyLimit: 200, sentToday: 0, warmupEnabled: false, healthScore: 58, status: "paused" },
+  ]
+
+  const step = (id: string, channel: Sequence["steps"][number]["channel"], dayOffset: number, subject?: string, body?: string) => ({ id, channel, dayOffset, subject, body })
+  const sequences: Sequence[] = [
+    {
+      id: "seq_1", name: "High intent – pricing visitors", status: "active", ownerId: "usr_4", mailboxIds: ["mb_1", "mb_2"], createdAt: ago(40),
+      steps: [
+        step("s1", "email", 0, "Quick question about {{company}}'s outbound", "Hi {{first_name}},\n\nNoticed {{company}} is scaling its sales team. Teams like yours use us to turn intent signals into booked meetings automatically.\n\nWorth a 15-minute look?\n\n{{sender_name}}"),
+        step("s2", "linkedin_connect", 1),
+        step("s3", "wait", 2),
+        step("s4", "email", 3, "Re: Quick question", "Hi {{first_name}}, bumping this — happy to share how {{similar_customer}} doubled pipeline in a quarter."),
+        step("s5", "call", 5),
+        step("s6", "email", 8, "Closing the loop", "Hi {{first_name}}, should I close the loop here? If timing is off, happy to reconnect next quarter."),
+      ],
+      stats: { enrolled: 214, sent: 842, opened: 512, replied: 61, meetings: 19, bounced: 9 },
+    },
+    {
+      id: "seq_2", name: "Congrats on the raise", status: "active", ownerId: "usr_1", mailboxIds: ["mb_1"], createdAt: ago(25),
+      steps: [
+        step("s1", "email", 0, "Congrats on the {{funding_round}}!", "Hi {{first_name}},\n\nCongrats on the round! Most teams we talk to post-raise are under pressure to 3x pipeline. Here's how we help..."),
+        step("s2", "linkedin_message", 2),
+        step("s3", "email", 5, "Pipeline plan for {{company}}", "Hi {{first_name}}, put together a quick plan for {{company}} — want me to send it over?"),
+      ],
+      stats: { enrolled: 58, sent: 149, opened: 101, replied: 17, meetings: 7, bounced: 2 },
+    },
+    {
+      id: "seq_3", name: "Champion job change", status: "active", ownerId: "usr_3", mailboxIds: ["mb_3"], createdAt: ago(60),
+      steps: [
+        step("s1", "linkedin_message", 0),
+        step("s2", "email", 2, "Congrats on the new role, {{first_name}}", "Hi {{first_name}}, congrats on joining {{company}}! Would love to help you get the same results you saw before."),
+      ],
+      stats: { enrolled: 23, sent: 41, opened: 33, replied: 11, meetings: 5, bounced: 0 },
+    },
+    {
+      id: "seq_4", name: "Cold – Fintech RevOps", status: "paused", ownerId: "usr_4", mailboxIds: ["mb_2"], createdAt: ago(90),
+      steps: [
+        step("s1", "email", 0, "RevOps at {{company}}", "Hi {{first_name}}, how is {{company}} prioritizing accounts today?"),
+        step("s2", "email", 4, "Following up", "Hi {{first_name}}, any thoughts?"),
+      ],
+      stats: { enrolled: 310, sent: 588, opened: 240, replied: 14, meetings: 3, bounced: 22 },
+    },
+    {
+      id: "seq_5", name: "Event follow-up (draft)", status: "draft", ownerId: "usr_2", mailboxIds: [], createdAt: ago(3),
+      steps: [step("s1", "email", 0, "Great meeting you at SaaStr", "Hi {{first_name}}, great chatting at the booth!")],
+      stats: { enrolled: 0, sent: 0, opened: 0, replied: 0, meetings: 0, bounced: 0 },
+    },
+  ]
+
+  const enrollments: Enrollment[] = contacts
+    .filter((c) => c.status !== "new")
+    .map((c, i) => {
+      const seq = sequences[i % 4]
+      return {
+        id: `enr_${i + 1}`,
+        sequenceId: seq.id,
+        contactId: c.id,
+        currentStep: int(0, seq.steps.length - 1),
+        status: c.status === "replied" || c.status === "meeting" ? "replied" : c.status === "bounced" ? "bounced" : c.status === "unsubscribed" ? "unsubscribed" : seq.status === "paused" ? "paused" : "active",
+        enrolledAt: ago(int(1, 30)),
+        nextStepAt: c.status === "in_sequence" ? ahead(int(0, 4)) : undefined,
+      }
+    })
+
+  // ---- Inbox ----
+  const replyBodies = [
+    { s: "positive", b: "Thanks for reaching out — timing is actually good. Can you do Thursday at 2pm?" },
+    { s: "positive", b: "Interesting. Can you send over pricing and a couple of case studies?" },
+    { s: "neutral", b: "Not the right person — try our Head of RevOps." },
+    { s: "negative", b: "Please remove me from your list." },
+    { s: "ooo", b: "I'm out of office until next Monday with limited access to email." },
+    { s: "positive", b: "We're evaluating tools this quarter. Let's chat next week." },
+  ] as const
+  const replied = contacts.filter((c) => c.status === "replied" || c.status === "meeting").slice(0, 16)
+  const inbox: InboxMessage[] = replied.map((c, i) => {
+    const r = replyBodies[i % replyBodies.length]
+    const seq = sequences[i % 3]
+    const at = ago(int(0, 6), int(0, 20))
+    return {
+      id: `msg_${i + 1}`,
+      contactId: c.id,
+      sequenceId: seq.id,
+      channel: i % 5 === 0 ? "linkedin" : "email",
+      subject: `Re: ${seq.steps[0].subject?.replace("{{company}}", "your team").replace("{{funding_round}}", "round").replace("{{first_name}}", c.firstName) ?? "LinkedIn message"}`,
+      snippet: r.b.slice(0, 80),
+      body: r.b,
+      receivedAt: at,
+      sentiment: r.s,
+      read: i > 4,
+      archived: false,
+      thread: [
+        { from: "us", body: `Hi ${c.firstName}, noticed your team is growing — worth a quick chat about how we can help book more meetings?`, at: ago(int(7, 12)) },
+        { from: "them", body: r.b, at },
+      ],
+    }
+  })
+  inbox.sort((a, b) => b.receivedAt.localeCompare(a.receivedAt))
+
+  // ---- Deals ----
+  const deals: Deal[] = []
+  const dealAccounts = [...realAccounts].sort((a, b) => b.score - a.score).slice(0, 34)
+  dealAccounts.forEach((a, i) => {
+    const stage = DEAL_STAGES[i % DEAL_STAGES.length]
+    const accContacts = contacts.filter((c) => c.accountId === a.id)
+    const created = int(5, 90)
+    deals.push({
+      id: `deal_${i + 1}`,
+      name: `${a.name} – ${pick(["Platform", "Growth plan", "Enterprise", "Pilot"])}`,
+      accountId: a.id,
+      contactId: accContacts[0]?.id,
+      ownerId: a.ownerId ?? pick(sellers),
+      stage: stage.id as DealStage,
+      amount: pick([12, 18, 24, 36, 48, 60, 90, 120]) * 1000,
+      probability: stage.probability,
+      closeDate: stage.id.startsWith("closed") ? ago(int(1, 40)) : ahead(int(5, 80)),
+      source: pick(["Agent: intent surge", "Sequence reply", "Inbound", "Agent: pricing visit", "Referral"]),
+      crmId: rand() > 0.3 ? `HS-${int(100000, 999999)}` : undefined,
+      syncedAt: rand() > 0.3 ? ago(0, int(1, 12)) : undefined,
+      notes: "",
+      createdAt: ago(created),
+      updatedAt: ago(int(0, Math.min(created, 10))),
+    })
+  })
+
+  // ---- Agent runs & drafts ----
+  const runs: AgentRun[] = []
+  const drafts: OutreachDraft[] = []
+  const recent = signals.slice(0, 40)
+  recent.forEach((s, i) => {
+    const a = accounts.find((x) => x.id === s.accountId)!
+    const rule = rules.find((r) => r.trigger === s.type && r.enabled)
+    const matched = rule && a.score >= rule.minScore && rule.tiers.includes(a.tier)
+    const before = Math.max(0, a.score - int(0, 9))
+    const needsApproval = matched && rule!.requireApproval && rule!.actions.includes("draft_outreach")
+    const contact = contacts.find((c) => c.accountId === a.id)
+    const run: AgentRun = {
+      id: `run_${i + 1}`,
+      signalId: s.id,
+      accountId: a.id,
+      ruleId: matched ? rule!.id : undefined,
+      trigger: `${s.source}: ${s.title}`,
+      startedAt: s.occurredAt,
+      durationMs: int(900, 6800),
+      status: !matched ? "skipped" : needsApproval && i < 14 ? "awaiting_approval" : i === 7 ? "failed" : "completed",
+      scoreBefore: before,
+      scoreAfter: a.score,
+      steps: [
+        { action: "evaluate", label: "Evaluate signal against playbooks", status: "done", detail: matched ? `Matched “${rule!.name}”` : "No playbook matched (score or tier below threshold)" },
+        { action: "rescore", label: "Re-score account", status: "done", detail: `${before} → ${a.score} (Tier ${a.tier})` },
+        ...(matched
+          ? rule!.actions.filter((x) => x !== "rescore").map((x) => ({
+              action: x,
+              label: x === "draft_outreach" ? "Draft outreach with Claude" : x === "route_owner" ? "Route to account owner" : x === "enroll_sequence" ? "Enroll contacts in sequence" : x === "create_deal" ? "Create discovery deal" : x === "enrich" ? "Waterfall enrichment" : "Notify owner in Slack",
+              status: (i === 7 && x === "enroll_sequence" ? "failed" : needsApproval && i < 14 && x === "draft_outreach" ? "pending" : "done") as "failed" | "pending" | "done",
+              detail: x === "route_owner" ? `Assigned to ${users.find((u) => u.id === a.ownerId)?.name ?? "round robin"}` : undefined,
+            }))
+          : []),
+      ],
+    }
+    runs.push(run)
+    if (run.status === "awaiting_approval" && contact) {
+      drafts.push({
+        id: `drf_${drafts.length + 1}`,
+        runId: run.id,
+        accountId: a.id,
+        contactId: contact.id,
+        channel: s.type === "job_change" ? "linkedin" : "email",
+        subject: `${a.name} + Acme Growth: ${s.type === "website_visit" ? "saw you checking us out" : "congrats on the news"}`,
+        body: `Hi ${contact.firstName},\n\n${s.type === "website_visit" ? `I noticed a few folks from ${a.name} exploring our pricing this week` : `Saw the news that ${a.name} ${s.title.toLowerCase()}`} — congrats. Teams in ${a.industry} at your stage usually hit a wall prioritizing accounts once the SDR team grows past five.\n\nWe help teams like yours route the right accounts to reps automatically based on fit and live intent. Would a 15-minute walkthrough next week be useful?\n\nBest,\nCasey`,
+        rationale: `${a.name} is Tier ${a.tier} (score ${a.score}). Signal: ${s.title}. ${contact.title} is the most senior contact in ${contact.department}.`,
+        status: "pending",
+        createdAt: s.occurredAt,
+        sequenceId: rule?.sequenceId,
+      })
+    }
+  })
+
+  // ---- Activities ----
+  const activities: Activity[] = []
+  let actIdx = 0
+  for (const s of signals.slice(0, 120)) {
+    activities.push({ id: `act_${++actIdx}`, accountId: s.accountId, contactId: s.contactId, type: "signal", title: s.title, detail: `${s.source} · strength ${s.strength}`, actorId: "system", at: s.occurredAt })
+  }
+  for (const r of runs) {
+    activities.push({ id: `act_${++actIdx}`, accountId: r.accountId, type: "agent", title: r.ruleId ? `Agent ran “${rules.find((x) => x.id === r.ruleId)?.name}”` : "Agent evaluated signal", detail: r.steps.map((s) => s.label).join(" → "), actorId: "agent", at: r.startedAt })
+  }
+  for (const d of deals) {
+    activities.push({ id: `act_${++actIdx}`, accountId: d.accountId, dealId: d.id, type: "stage_change", title: `Deal moved to ${DEAL_STAGES.find((s) => s.id === d.stage)?.label}`, actorId: d.ownerId, at: d.updatedAt })
+  }
+  for (const a of accounts.slice(0, 30)) {
+    activities.push({ id: `act_${++actIdx}`, accountId: a.id, type: pick(["note", "call", "meeting", "email"] as const), title: pick(["Intro call with champion", "Sent case study", "Discovery meeting booked", "Left voicemail", "Shared pricing deck"]), actorId: a.ownerId ?? "usr_1", at: ago(int(0, 20)) })
+  }
+  activities.sort((a, b) => b.at.localeCompare(a.at))
+
+  // ---- Integrations ----
+  const connected = new Set(["int_clearbit", "int_apollo", "int_fullenrich", "int_bombora", "int_rb2b", "int_trigify", "int_apify", "int_mailpool", "int_heyreach", "int_hubspot", "int_anthropic", "int_ses", "int_linkup"])
+  const integrations: Integration[] = INTEGRATIONS.map((x) => {
+    const isOn = connected.has(x.id)
+    return {
+      ...x,
+      connected: isOn,
+      status: !isOn ? "disconnected" : x.id === "int_apify" ? "error" : "ok",
+      lastSyncAt: isOn ? ago(0, int(0, 8)) : undefined,
+      apiKeyMasked: isOn ? `••••••••${Math.random().toString(36).slice(2, 6)}` : undefined,
+      usage: isOn ? { used: int(1200, 9000), limit: 10000, unit: x.category === "llm" ? "k tokens" : "credits" } : undefined,
+      settings: { autoSync: true, syncInterval: "hourly", writeBack: x.category === "crm" },
+    }
+  })
+
+  const notifications: AppNotification[] = [
+    { id: "ntf_1", kind: "agent", title: `${drafts.length} drafts awaiting approval`, body: "The orchestration agent drafted outreach for high-intent accounts.", href: "/agent?tab=approvals", at: ago(0, 1), read: false },
+    { id: "ntf_2", kind: "reply", title: "New positive reply", body: `${inbox[0] ? contacts.find((c) => c.id === inbox[0].contactId)?.firstName : "A prospect"} wants to book a meeting.`, href: "/outreach?tab=inbox", at: ago(0, 2), read: false },
+    { id: "ntf_3", kind: "signal", title: `${accounts[0].name} surging`, body: "Visited pricing 3 times in the last 24 hours.", href: `/accounts/${accounts[0].id}`, at: ago(0, 5), read: false },
+    { id: "ntf_4", kind: "system", title: "Apify sync failed", body: "Authentication error — reconnect the integration.", href: "/integrations", at: ago(1), read: true },
+    { id: "ntf_5", kind: "deal", title: "Deal moved to Negotiation", body: `${deals[4]?.name} is now in Negotiation.`, href: "/pipeline", at: ago(2), read: true },
+  ]
+
+  return {
+    org,
+    currentUserId: "usr_1",
+    users,
+    apiKeys,
+    accounts,
+    contacts,
+    signals,
+    icp,
+    rules,
+    runs,
+    drafts,
+    sequences,
+    enrollments,
+    mailboxes,
+    inbox,
+    deals,
+    activities,
+    integrations,
+    notifications,
+  }
+}

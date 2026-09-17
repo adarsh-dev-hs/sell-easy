@@ -1,0 +1,347 @@
+// Domain types mirroring the backend service boundaries.
+
+export type ID = string
+
+// ---------- Auth service ----------
+export type Role = "owner" | "admin" | "member" | "viewer"
+
+export interface User {
+  id: ID
+  name: string
+  email: string
+  role: Role
+  avatarColor: string
+  title?: string
+  status: "active" | "invited"
+  lastActiveAt?: string
+}
+
+export interface Organization {
+  id: ID
+  name: string
+  domain: string
+  plan: "starter" | "growth" | "enterprise"
+  seats: number
+  timezone: string
+}
+
+export interface ApiKey {
+  id: ID
+  name: string
+  prefix: string
+  scopes: string[]
+  createdAt: string
+  lastUsedAt?: string
+  createdBy: ID
+  revoked: boolean
+}
+
+// ---------- Entity service ----------
+export type Tier = "A" | "B" | "C" | "D"
+
+export type AccountStage =
+  | "new"
+  | "researching"
+  | "engaged"
+  | "opportunity"
+  | "customer"
+  | "disqualified"
+
+export interface ScorePoint {
+  at: string
+  fit: number
+  intent: number
+  score: number
+  reason: string
+}
+
+export interface EntityVersion {
+  version: number
+  at: string
+  source: string
+  changes: { field: string; from: string; to: string }[]
+}
+
+export interface Account {
+  id: ID
+  name: string
+  domain: string
+  industry: string
+  employees: number
+  revenue: number // USD
+  country: string
+  city: string
+  technologies: string[]
+  fundingStage: string
+  description: string
+  linkedinUrl: string
+  ownerId: ID | null
+  stage: AccountStage
+  fitScore: number
+  intentScore: number
+  score: number
+  tier: Tier
+  scoreHistory: ScorePoint[]
+  enrichedAt?: string
+  enrichmentSources: string[]
+  versions: EntityVersion[]
+  tags: string[]
+  duplicateOf?: ID
+  createdAt: string
+  updatedAt: string
+}
+
+export type Seniority = "C-Level" | "VP" | "Director" | "Manager" | "IC"
+
+export interface Contact {
+  id: ID
+  accountId: ID
+  firstName: string
+  lastName: string
+  title: string
+  seniority: Seniority
+  department: string
+  email: string
+  emailStatus: "verified" | "unverified" | "invalid" | "missing"
+  phone?: string
+  linkedinUrl: string
+  location: string
+  ownerId: ID | null
+  status: "new" | "in_sequence" | "replied" | "meeting" | "unsubscribed" | "bounced"
+  lastContactedAt?: string
+  createdAt: string
+}
+
+// ---------- Signal ingestion ----------
+export type SignalType =
+  | "intent_topic"
+  | "website_visit"
+  | "hiring"
+  | "funding"
+  | "job_change"
+  | "tech_install"
+  | "social_engagement"
+  | "news"
+
+export interface Signal {
+  id: ID
+  type: SignalType
+  source: string
+  accountId: ID
+  contactId?: ID
+  title: string
+  detail: string
+  strength: number // 0-100
+  occurredAt: string
+  processed: boolean
+}
+
+// ---------- ICP / Scoring ----------
+export interface IcpConfig {
+  industries: string[]
+  countries: string[]
+  employeeMin: number
+  employeeMax: number
+  revenueMin: number
+  technologies: string[]
+  fundingStages: string[]
+  fitWeight: number // 0-100, intent weight = 100 - fitWeight
+  signalWeights: Record<SignalType, number> // 0-100
+  intentDecayDays: number
+  tierThresholds: { A: number; B: number; C: number }
+  updatedAt: string
+}
+
+// ---------- Orchestration agent ----------
+export type AgentActionType =
+  | "rescore"
+  | "route_owner"
+  | "draft_outreach"
+  | "enroll_sequence"
+  | "create_deal"
+  | "notify"
+  | "enrich"
+
+export interface PlaybookRule {
+  id: ID
+  name: string
+  description: string
+  enabled: boolean
+  trigger: SignalType | "any"
+  minScore: number
+  tiers: Tier[]
+  actions: AgentActionType[]
+  sequenceId?: ID
+  requireApproval: boolean
+  runs: number
+}
+
+export interface AgentStep {
+  action: AgentActionType | "evaluate"
+  label: string
+  status: "done" | "skipped" | "pending" | "failed"
+  detail?: string
+}
+
+export interface AgentRun {
+  id: ID
+  signalId?: ID
+  accountId: ID
+  ruleId?: ID
+  trigger: string
+  startedAt: string
+  durationMs: number
+  status: "completed" | "awaiting_approval" | "failed" | "skipped"
+  steps: AgentStep[]
+  scoreBefore?: number
+  scoreAfter?: number
+}
+
+export interface OutreachDraft {
+  id: ID
+  runId?: ID
+  accountId: ID
+  contactId: ID
+  channel: "email" | "linkedin"
+  subject: string
+  body: string
+  rationale: string
+  status: "pending" | "approved" | "rejected" | "sent"
+  createdAt: string
+  sequenceId?: ID
+}
+
+// ---------- Outreach ----------
+export type StepChannel = "email" | "linkedin_connect" | "linkedin_message" | "call" | "wait"
+
+export interface SequenceStep {
+  id: ID
+  channel: StepChannel
+  dayOffset: number
+  subject?: string
+  body?: string
+}
+
+export interface Sequence {
+  id: ID
+  name: string
+  status: "active" | "paused" | "draft"
+  ownerId: ID
+  mailboxIds: ID[]
+  steps: SequenceStep[]
+  createdAt: string
+  stats: { enrolled: number; sent: number; opened: number; replied: number; meetings: number; bounced: number }
+}
+
+export interface Enrollment {
+  id: ID
+  sequenceId: ID
+  contactId: ID
+  currentStep: number
+  status: "active" | "paused" | "completed" | "replied" | "bounced" | "unsubscribed"
+  enrolledAt: string
+  nextStepAt?: string
+}
+
+export interface Mailbox {
+  id: ID
+  email: string
+  provider: "SES" | "Google" | "Microsoft" | "Mailpool"
+  dailyLimit: number
+  sentToday: number
+  warmupEnabled: boolean
+  healthScore: number
+  status: "healthy" | "warning" | "paused"
+}
+
+export interface InboxMessage {
+  id: ID
+  contactId: ID
+  sequenceId?: ID
+  channel: "email" | "linkedin"
+  subject: string
+  snippet: string
+  body: string
+  receivedAt: string
+  sentiment: "positive" | "neutral" | "negative" | "ooo"
+  read: boolean
+  archived: boolean
+  thread: { from: "us" | "them"; body: string; at: string }[]
+}
+
+// ---------- CRM / Pipeline ----------
+export type DealStage =
+  | "discovery"
+  | "qualified"
+  | "demo"
+  | "proposal"
+  | "negotiation"
+  | "closed_won"
+  | "closed_lost"
+
+export interface Deal {
+  id: ID
+  name: string
+  accountId: ID
+  contactId?: ID
+  ownerId: ID
+  stage: DealStage
+  amount: number
+  probability: number
+  closeDate: string
+  source: string
+  crmId?: string
+  syncedAt?: string
+  notes: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface Activity {
+  id: ID
+  accountId?: ID
+  contactId?: ID
+  dealId?: ID
+  type: "note" | "email" | "call" | "meeting" | "stage_change" | "enrichment" | "score_change" | "agent" | "signal"
+  title: string
+  detail?: string
+  actorId?: ID | "agent" | "system"
+  at: string
+}
+
+// ---------- Integrations ----------
+export type IntegrationCategory =
+  | "enrichment"
+  | "intent"
+  | "contacts"
+  | "scraping"
+  | "email"
+  | "linkedin"
+  | "calls"
+  | "crm"
+  | "llm"
+
+export interface Integration {
+  id: ID
+  name: string
+  category: IntegrationCategory
+  description: string
+  feeds: string
+  connected: boolean
+  status: "ok" | "error" | "syncing" | "disconnected"
+  lastSyncAt?: string
+  apiKeyMasked?: string
+  usage?: { used: number; limit: number; unit: string }
+  settings: Record<string, string | boolean>
+}
+
+// ---------- Notifications ----------
+export interface AppNotification {
+  id: ID
+  title: string
+  body: string
+  href?: string
+  at: string
+  read: boolean
+  kind: "signal" | "agent" | "reply" | "deal" | "system"
+}

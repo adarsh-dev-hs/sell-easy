@@ -1,36 +1,51 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SellEasy — Frontend
 
-## Getting Started
-
-First, run the development server:
+Agentic GTM platform UI built with **Next.js 16 (App Router) + React 19 + TypeScript + Tailwind v4 + shadcn/ui**.
+All data is mocked: a seeded dataset lives in a persisted [zustand](https://github.com/pmndrs/zustand) store
+(`localStorage` key `sell-easy-demo`) that behaves like the backend services in the architecture doc.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+npm run dev        # http://localhost:3000  (demo login is pre-filled)
+npm run build && npm start
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Use **Reset demo data** (user menu or Settings → Organization) to restore the seed dataset.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Pages ↔ services
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Route | Service | What you can do |
+|---|---|---|
+| `/login` | Auth | Mock email/SSO sign-in and sign-up |
+| `/dashboard` | Analytics | KPIs, signal activity, pipeline by stage, hot accounts, agent feed |
+| `/accounts`, `/accounts/[id]` | Entity | Search/filter/sort, add/edit/delete, waterfall enrichment, re-score, owner routing, dedup merge, score breakdown, version history, activity timeline |
+| `/contacts` | Entity | Contacts table, email verification, sequence enrollment, detail sheet |
+| `/signals` | Signal ingestion | Live feed, manual ingest, simulation, process pending signals |
+| `/scoring` | ICP/Scoring | ICP criteria, fit/intent weights, signal weights, tier thresholds with live preview → re-score all |
+| `/agent` | Orchestration agent | Autopilot, run log with step timeline, approval queue for AI drafts, playbook rules |
+| `/outreach`, `/outreach/[id]` | Outreach | Sequences + step builder, enrollments, reply inbox, mailbox deliverability |
+| `/pipeline` | CRM/Pipeline | Drag-and-drop kanban, table view, deal sheet, CRM sync |
+| `/analytics` | Analytics | Attribution, funnel, tier performance, sequence and rep leaderboards, CSV export |
+| `/integrations` | Vendors | Connect/configure/sync Clearbit, Apollo, Bombora, RB2B, HeyReach, HubSpot, Anthropic… |
+| `/settings` | Auth | Profile, organization & plan, team & roles, API keys, notifications, appearance |
 
-## Learn More
+Press **⌘K** anywhere for global search, and use **Simulate signal** in the header to watch the orchestration
+agent re-score an account, match a playbook and route, draft, enroll or open a deal end-to-end.
 
-To learn more about Next.js, take a look at the following resources:
+## Structure
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```
+src/
+  app/(app)/…            authenticated pages (sidebar layout + auth guard)
+  app/login              sign-in
+  components/ui          shadcn/ui primitives
+  components/layout      sidebar, header, command menu, notifications
+  components/shared      page header, score/tier badges, avatars, status badges…
+  lib/types.ts           domain model (mirrors service boundaries)
+  lib/mock-data.ts       deterministic seed generator
+  lib/scoring.ts         fit / intent / tier scoring engine
+  lib/store.ts           mock backend: state + all service actions
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Swapping in the real API later means replacing store actions with calls to the API gateway; page components only
+talk to the store.
