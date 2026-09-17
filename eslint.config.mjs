@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Generated from backend/src by `npm run mock:sync` (linted in the backend repo).
+    "src/mock-api/core/**",
+    "src/mock-api/overrides/**",
   ]),
 ]);
 

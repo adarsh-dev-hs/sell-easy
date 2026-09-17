@@ -3,6 +3,14 @@ import { useAuthStore } from "./auth-store"
 
 export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000/api/v1").replace(/\/$/, "")
 
+/**
+ * Where data comes from:
+ * - "api"  (default) — the SellEasy backend at NEXT_PUBLIC_API_URL.
+ * - "mock" — an in-browser copy of the backend with demo data (src/mock-api); no server needed.
+ */
+export const DATA_SOURCE: "api" | "mock" = process.env.NEXT_PUBLIC_DATA_SOURCE === "mock" ? "mock" : "api"
+export const IS_MOCK = DATA_SOURCE === "mock"
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -23,49 +31,82 @@ export class ApiError extends Error {
 
 export type Query = Record<string, string | number | boolean | string[] | null | undefined>
 
-function buildUrl(path: string, query?: Query) {
-  const url = new URL(API_URL + path)
+function toSearchParams(query?: Query) {
+  const params = new URLSearchParams()
   for (const [k, v] of Object.entries(query ?? {})) {
     if (v === undefined || v === null || v === "") continue
     if (Array.isArray(v)) {
-      if (v.length) url.searchParams.set(k, v.join(","))
-    } else url.searchParams.set(k, String(v))
+      if (v.length) params.set(k, v.join(","))
+    } else params.set(k, String(v))
   }
-  return url.toString()
+  return params
 }
 
-async function request<T>(method: string, path: string, opts: { query?: Query; body?: unknown; raw?: boolean } = {}): Promise<T> {
-  const token = useAuthStore.getState().token
+interface RawResponse {
+  status: number
+  statusText: string
+  json: () => Promise<unknown>
+  text: () => Promise<string>
+}
+
+async function send(method: string, path: string, query: Query | undefined, body: unknown, token: string | null): Promise<RawResponse> {
+  const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {}
+
+  if (IS_MOCK) {
+    const { mockRequest } = await import("@/mock-api/server")
+    const res = await mockRequest({
+      method,
+      path,
+      query: Object.fromEntries(toSearchParams(query)),
+      body,
+      headers: { authorization: headers.Authorization },
+    })
+    return {
+      status: res.status,
+      statusText: "",
+      json: async () => res.json ?? null,
+      text: async () => res.text ?? JSON.stringify(res.json ?? ""),
+    }
+  }
+
+  const qs = toSearchParams(query).toString()
   let res: Response
   try {
-    res = await fetch(buildUrl(path, opts.query), {
+    res = await fetch(`${API_URL}${path}${qs ? `?${qs}` : ""}`, {
       method,
       headers: {
         Accept: "application/json",
-        ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...headers,
       },
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
     })
   } catch {
     throw new ApiError(0, "network_error", `Cannot reach the API at ${API_URL}. Is the backend running?`)
   }
+  return { status: res.status, statusText: res.statusText, json: () => res.json(), text: () => res.text() }
+}
+
+async function request<T>(method: string, path: string, opts: { query?: Query; body?: unknown; raw?: boolean } = {}): Promise<T> {
+  const token = useAuthStore.getState().token
+  const res = await send(method, path, opts.query, opts.body, token)
+  const ok = res.status >= 200 && res.status < 300
 
   if (res.status === 401 && token) {
     useAuthStore.getState().clear()
   }
   if (res.status === 204) return undefined as T
   if (opts.raw) {
-    if (!res.ok) throw new ApiError(res.status, "request_failed", res.statusText)
+    if (!ok) throw new ApiError(res.status, "request_failed", res.statusText || "Request failed")
     return (await res.text()) as T
   }
 
   const json = (await res.json().catch(() => null)) as
     | { data?: unknown; meta?: PageMeta; error?: { code: string; message: string; details?: unknown } }
     | null
-  if (!res.ok || !json) {
+  if (!ok || !json) {
     const err = json?.error
-    throw new ApiError(res.status, err?.code ?? "request_failed", err?.message ?? res.statusText, err?.details)
+    throw new ApiError(res.status, err?.code ?? "request_failed", err?.message ?? (res.statusText || "Request failed"), err?.details)
   }
   return (json.meta ? { data: json.data, meta: json.meta } : json.data) as T
 }

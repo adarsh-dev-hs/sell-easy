@@ -9,7 +9,10 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { API_URL, ApiError, errorMessage, useAcceptInvite, useLogin, useRegister, useSession } from "@/lib/api"
+import { API_URL, ApiError, errorMessage, IS_MOCK, useAcceptInvite, useLogin, useRegister, useSession } from "@/lib/api"
+
+// Demo credentials for NEXT_PUBLIC_DATA_SOURCE=mock (see src/mock-api/overrides/config.ts).
+const DEMO_LOGIN = { email: "jordan@acmegrowth.com", password: "demo1234" }
 
 const FEATURES = [
   { icon: RadioTowerIcon, title: "Live buying signals", body: "Intent, hiring, funding and web visits unified per account." },
@@ -32,8 +35,8 @@ function LoginInner() {
   const accept = useAcceptInvite()
 
   const [tab, setTab] = useState(inviteToken ? "invite" : "login")
-  const [email, setEmail] = useState("")
-  const [password, setPassword] = useState("")
+  const [email, setEmail] = useState(IS_MOCK ? DEMO_LOGIN.email : "")
+  const [password, setPassword] = useState(IS_MOCK ? DEMO_LOGIN.password : "")
   const [name, setName] = useState("")
   const [orgName, setOrgName] = useState("")
   const [domain, setDomain] = useState("")
@@ -98,7 +101,9 @@ function LoginInner() {
             ))}
           </div>
         </div>
-        <p className="text-sm text-primary-foreground/70">Connected to {API_URL.replace(/^https?:\/\//, "")}</p>
+        <p className="text-sm text-primary-foreground/70">
+          {IS_MOCK ? "Demo mode · sample data stored in this browser" : `Connected to ${API_URL.replace(/^https?:\/\//, "")}`}
+        </p>
       </div>
 
       <div className="flex items-center justify-center p-6">
@@ -136,7 +141,17 @@ function LoginInner() {
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
                       />
-                      <FieldDescription>First run? Use the admin from backend <code>BOOTSTRAP_ADMIN_*</code>.</FieldDescription>
+                      <FieldDescription>
+                        {IS_MOCK ? (
+                          <>
+                            Demo login: <code>{DEMO_LOGIN.email}</code> / <code>{DEMO_LOGIN.password}</code> (pre-filled).
+                          </>
+                        ) : (
+                          <>
+                            First run? Use the admin from backend <code>BOOTSTRAP_ADMIN_*</code>.
+                          </>
+                        )}
+                      </FieldDescription>
                     </Field>
                     <Button type="submit" disabled={busy} className="w-full">
                       {login.isPending && <Loader2Icon className="animate-spin" />}

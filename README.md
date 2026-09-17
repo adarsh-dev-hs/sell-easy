@@ -1,15 +1,22 @@
 # SellEasy — Frontend
 
 Agentic GTM platform UI built with **Next.js 16 (App Router) + React 19 + TypeScript + Tailwind v4 + shadcn/ui**.
-The frontend holds **no data**: every page reads and writes through the SellEasy API (`../backend`) using
-[TanStack Query](https://tanstack.com/query). Only the session token is kept in the browser.
+Every page reads and writes through the SellEasy API contract using [TanStack Query](https://tanstack.com/query).
+Where that API lives depends on `NEXT_PUBLIC_DATA_SOURCE`:
+
+- **`api` (default):** the real backend at `NEXT_PUBLIC_API_URL` (`../backend`). The browser keeps only the session token.
+- **`mock`:** an in-browser copy of the backend (`src/mock-api`) with demo data in `localStorage`. Use it for frontend-only
+  deployments such as a Vercel demo. The demo login is `jordan@acmegrowth.com` / `demo1234`.
 
 ```bash
-cp .env.example .env.local   # NEXT_PUBLIC_API_URL=http://localhost:4000/api/v1
+cp .env.example .env.local   # NEXT_PUBLIC_DATA_SOURCE=api, NEXT_PUBLIC_API_URL=http://localhost:4000/api/v1
 npm install
 npm run dev                  # http://localhost:3000 (start the backend first)
+NEXT_PUBLIC_DATA_SOURCE=mock npm run dev   # no backend needed
 npm run build && npm start
 ```
+
+`src/mock-api/core` is generated from `../backend/src`. Run `npm run mock:sync` after backend changes, and use `npm run mock:check` in CI.
 
 ## Pages ↔ services
 
@@ -40,7 +47,8 @@ src/
   components/ui          shadcn/ui primitives
   components/layout      sidebar, header, command menu, notifications
   components/shared      page header, score/tier badges, avatars, status badges, query states…
-  lib/api/client.ts      fetch wrapper (base URL, bearer token, error envelope)
+  lib/api/client.ts      transport (fetch to the API, or the in-browser mock), bearer token, error envelope
+  mock-api/              mock data mode: server.ts dispatcher, core/ (generated from backend), overrides/, shims/
   lib/api/hooks/*        typed TanStack Query hooks per service
   lib/api/auth-store.ts  persisted session (token + cached user/org)
   lib/types.ts           API contract types (mirrors backend/src/domain/types.ts)

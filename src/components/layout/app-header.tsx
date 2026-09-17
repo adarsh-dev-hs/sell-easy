@@ -18,6 +18,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar"
 import { Switch } from "@/components/ui/switch"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import {
+  IS_MOCK,
   canWrite,
   useAccount,
   useAgentSettings,
@@ -89,6 +90,18 @@ export function AppHeader() {
         </BreadcrumbList>
       </Breadcrumb>
       <div className="ml-auto flex items-center gap-2">
+        {IS_MOCK && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="hidden rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 md:inline dark:text-amber-400">
+                Demo data
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              Running in mock mode (NEXT_PUBLIC_DATA_SOURCE=mock): data lives in this browser, no backend is used.
+            </TooltipContent>
+          </Tooltip>
+        )}
         <div className="hidden sm:block">
           <CommandMenu />
         </div>

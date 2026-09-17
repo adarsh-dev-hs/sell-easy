@@ -1,5 +1,5 @@
 // Single entry point for the frontend data layer: `import { useAccounts } from "@/lib/api"`.
-export { api, ApiError, API_URL, downloadText, errorMessage } from "./client"
+export { api, ApiError, API_URL, DATA_SOURCE, IS_MOCK, downloadText, errorMessage } from "./client"
 export { useAuthStore } from "./auth-store"
 export { useApiMutation, useApiQuery } from "./query"
 export * from "./hooks/auth"

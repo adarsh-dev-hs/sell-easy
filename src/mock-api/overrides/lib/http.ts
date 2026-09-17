@@ -1,0 +1,19 @@
+// Browser replacement for backend/src/lib/http.ts: registers routes without Express.
+import { type RouteDef, routeRegistry } from "./route-runtime"
+
+export * from "./route-runtime"
+
+const noopRouter = { use: (..._args: unknown[]) => undefined }
+
+export function createModule(tag: string, basePath: string) {
+  function route<B = unknown, Q = unknown, P = Record<string, string>>(def: RouteDef<B, Q, P>) {
+    routeRegistry.push({
+      tag,
+      fullPath: basePath + (def.path === "/" ? "" : def.path),
+      def: def as RouteDef<unknown, unknown, unknown>,
+    })
+  }
+  return { router: noopRouter, route, basePath, tag }
+}
+
+export type AppModule = ReturnType<typeof createModule>
