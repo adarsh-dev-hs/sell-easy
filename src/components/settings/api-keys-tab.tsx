@@ -1,11 +1,11 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { KeyRoundIcon, PlusIcon, TriangleAlertIcon, WebhookIcon } from "lucide-react"
-import { toast } from "sonner"
+import { KeyRoundIcon, Loader2Icon, PlusIcon, TriangleAlertIcon, WebhookIcon } from "lucide-react"
 import { UserAvatar } from "@/components/shared/avatars"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
 import { EmptyState } from "@/components/shared/empty-state"
+import { QueryError, TableSkeleton } from "@/components/shared/query-state"
 import { StatusBadge } from "@/components/shared/status"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -16,39 +16,32 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { API_SCOPES } from "@/lib/constants"
+import { API_URL, ApiError, isAdmin, useApiKeys, useCreateApiKey, useCurrentUser, useMeta, useRevokeApiKey, useUsers } from "@/lib/api"
 import { shortDate, timeAgo } from "@/lib/format"
-import { useCurrentUser, useLookup, useStore } from "@/lib/store"
 import type { ApiKey } from "@/lib/types"
-import { canManageOrg, CopyButton } from "./shared"
+import { CopyButton } from "./shared"
 
-const INGEST_URL = "https://api.selleasy.dev/v1/signals/ingest"
+const INGEST_URL = `${API_URL}/webhooks/signals`
 
 const CURL_EXAMPLE = `curl -X POST ${INGEST_URL} \\
-  -H "Authorization: Bearer $SELLEASY_API_KEY" \\
+  -H "x-api-key: $SELLEASY_API_KEY" \\
   -H "Content-Type: application/json" \\
-  -d '{
-    "type": "website_visit",
-    "domain": "acme.com",
-    "title": "Visited pricing page",
-    "strength": 80,
-    "source": "custom"
-  }'`
+  -d '{"type":"website_visit","domain":"example.com","title":"Visited pricing page","strength":80,"source":"RB2B"}'`
 
 export function ApiKeysTab() {
-  const apiKeys = useStore((s) => s.apiKeys)
-  const revokeApiKey = useStore((s) => s.revokeApiKey)
-  const lookup = useLookup()
   const me = useCurrentUser()
-  const canManage = canManageOrg(me?.role)
+  const canManage = isAdmin(me.role)
+  const apiKeys = useApiKeys(canManage)
+  const users = useUsers()
+  const revokeApiKey = useRevokeApiKey()
   const [createOpen, setCreateOpen] = useState(false)
   const [revokeTarget, setRevokeTarget] = useState<ApiKey | null>(null)
 
   const sorted = useMemo(
-    () => [...apiKeys].sort((a, b) => Number(a.revoked) - Number(b.revoked) || b.createdAt.localeCompare(a.createdAt)),
-    [apiKeys],
+    () => [...(apiKeys.data ?? [])].sort((a, b) => Number(a.revoked) - Number(b.revoked) || b.createdAt.localeCompare(a.createdAt)),
+    [apiKeys.data],
   )
-  const activeCount = apiKeys.filter((k) => !k.revoked).length
+  const activeCount = sorted.filter((k) => !k.revoked).length
 
   return (
     <div className="space-y-6">
@@ -65,7 +58,13 @@ export function ApiKeysTab() {
           </CardAction>
         </CardHeader>
         <CardContent>
-          {sorted.length === 0 ? (
+          {!canManage ? (
+            <EmptyState icon={KeyRoundIcon} title="Admins only" description="Ask a workspace owner or admin to manage API keys." />
+          ) : apiKeys.isError ? (
+            <QueryError error={apiKeys.error} onRetry={() => apiKeys.refetch()} />
+          ) : apiKeys.isPending ? (
+            <TableSkeleton rows={3} className="rounded-lg border" />
+          ) : sorted.length === 0 ? (
             <EmptyState icon={KeyRoundIcon} title="No API keys yet" description="Create a key to start calling the SellEasy API." />
           ) : (
             <div className="overflow-x-auto rounded-lg border">
@@ -86,7 +85,7 @@ export function ApiKeysTab() {
                 </TableHeader>
                 <TableBody>
                   {sorted.map((k) => {
-                    const creator = lookup.user(k.createdBy)
+                    const creator = users.data?.find((u) => u.id === k.createdBy)
                     return (
                       <TableRow key={k.id} className={k.revoked ? "opacity-60" : undefined}>
                         <TableCell className="font-medium">{k.name}</TableCell>
@@ -115,7 +114,13 @@ export function ApiKeysTab() {
                         </TableCell>
                         <TableCell className="text-right">
                           {!k.revoked && (
-                            <Button size="sm" variant="ghost" className="text-destructive" disabled={!canManage} onClick={() => setRevokeTarget(k)}>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="text-destructive"
+                              disabled={!canManage || (revokeApiKey.isPending && revokeApiKey.variables === k.id)}
+                              onClick={() => setRevokeTarget(k)}
+                            >
                               Revoke
                             </Button>
                           )}
@@ -135,7 +140,11 @@ export function ApiKeysTab() {
           <CardTitle className="flex items-center gap-2">
             <WebhookIcon className="size-4" /> Webhook endpoint
           </CardTitle>
-          <CardDescription>POST custom signals from any source. Requires a key with the signals:write scope.</CardDescription>
+          <CardDescription>
+            POST custom signals from any source. Send the key in the <code className="font-mono text-xs">x-api-key</code> header; it needs
+            the signals:write scope. Resolve the account by <code className="font-mono text-xs">domain</code> or{" "}
+            <code className="font-mono text-xs">accountId</code>, or send up to 100 as <code className="font-mono text-xs">{"{ signals: [...] }"}</code>.
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="flex items-center gap-2">
@@ -165,9 +174,7 @@ export function ApiKeysTab() {
         confirmLabel="Revoke key"
         onConfirm={() => {
           if (!revokeTarget) return
-          revokeApiKey(revokeTarget.id)
-          toast.success(`Revoked “${revokeTarget.name}”`)
-          setRevokeTarget(null)
+          revokeApiKey.mutate(revokeTarget.id, { onSuccess: () => setRevokeTarget(null) })
         }}
       />
     </div>
@@ -175,26 +182,40 @@ export function ApiKeysTab() {
 }
 
 function CreateKeyFlow({ onDone }: { onDone: () => void }) {
-  const createApiKey = useStore((s) => s.createApiKey)
+  const createApiKey = useCreateApiKey()
+  const meta = useMeta()
+  const allScopes = meta.data?.apiScopes ?? []
   const [name, setName] = useState("")
   const [scopes, setScopes] = useState<string[]>(["accounts:read"])
   const [submitted, setSubmitted] = useState(false)
+  const [serverErrors, setServerErrors] = useState<{ name?: string; scopes?: string }>({})
   const [secret, setSecret] = useState<string | null>(null)
 
   const errors = {
-    name: name.trim().length < 3 ? "Give the key a descriptive name (3+ characters)." : null,
-    scopes: scopes.length === 0 ? "Select at least one scope." : null,
+    name: name.trim().length < 3 ? "Give the key a descriptive name (3+ characters)." : (serverErrors.name ?? null),
+    scopes: scopes.length === 0 ? "Select at least one scope." : (serverErrors.scopes ?? null),
   }
 
-  const toggle = (scope: string, on: boolean) =>
-    setScopes((s) => (on ? [...s, scope] : s.filter((x) => x !== scope)).sort((a, b) => API_SCOPES.indexOf(a) - API_SCOPES.indexOf(b)))
+  const toggle = (scope: string, on: boolean) => {
+    setServerErrors((x) => ({ ...x, scopes: undefined }))
+    setScopes((s) => (on ? [...s, scope] : s.filter((x) => x !== scope)).sort((a, b) => allScopes.indexOf(a) - allScopes.indexOf(b)))
+  }
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     setSubmitted(true)
     if (errors.name || errors.scopes) return
-    setSecret(createApiKey(name.trim(), scopes))
-    toast.success("API key created")
+    createApiKey.mutate(
+      { name: name.trim(), scopes },
+      {
+        onSuccess: (r) => setSecret(r.secret),
+        onError: (err) => {
+          if (!(err instanceof ApiError)) return
+          const f = err.fieldErrors
+          setServerErrors({ name: f.name?.[0], scopes: f.scopes?.[0] ?? Object.entries(f).find(([k]) => k.startsWith("scopes"))?.[1][0] })
+        },
+      },
+    )
   }
 
   if (secret) {
@@ -234,7 +255,10 @@ function CreateKeyFlow({ onDone }: { onDone: () => void }) {
             autoFocus
             placeholder="e.g. Segment signal forwarder"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => {
+              setName(e.target.value)
+              setServerErrors((x) => ({ ...x, name: undefined }))
+            }}
             aria-invalid={submitted && !!errors.name}
           />
           {submitted && errors.name && <FieldError>{errors.name}</FieldError>}
@@ -243,7 +267,8 @@ function CreateKeyFlow({ onDone }: { onDone: () => void }) {
           <FieldLegend variant="label">Scopes</FieldLegend>
           <FieldDescription>Read scopes are safe to share with BI tools; write scopes can change data.</FieldDescription>
           <div className="grid gap-2 sm:grid-cols-2">
-            {API_SCOPES.map((scope) => (
+            {meta.isPending && <p className="text-sm text-muted-foreground">Loading scopes…</p>}
+            {allScopes.map((scope) => (
               <Field key={scope} orientation="horizontal">
                 <Checkbox id={`scope-${scope}`} checked={scopes.includes(scope)} onCheckedChange={(v) => toggle(scope, v === true)} />
                 <FieldLabel htmlFor={`scope-${scope}`} className="font-mono text-xs font-normal">
@@ -256,10 +281,13 @@ function CreateKeyFlow({ onDone }: { onDone: () => void }) {
         </FieldSet>
       </FieldGroup>
       <DialogFooter>
-        <Button type="button" variant="outline" onClick={onDone}>
+        <Button type="button" variant="outline" onClick={onDone} disabled={createApiKey.isPending}>
           Cancel
         </Button>
-        <Button type="submit">Create key</Button>
+        <Button type="submit" disabled={createApiKey.isPending}>
+          {createApiKey.isPending && <Loader2Icon className="animate-spin" />}
+          Create key
+        </Button>
       </DialogFooter>
     </form>
   )

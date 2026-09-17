@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
@@ -29,101 +29,113 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { OwnerLabel } from "@/components/shared/avatars"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
 import { EmptyState } from "@/components/shared/empty-state"
+import { QueryError, TableSkeleton } from "@/components/shared/query-state"
 import { StatCard } from "@/components/shared/stat-card"
 import { StatusBadge } from "@/components/shared/status"
+import {
+  canWrite,
+  type SequenceRecord,
+  useCurrentUser,
+  useDeleteSequence,
+  useDuplicateSequence,
+  useOutreachStats,
+  useSequences,
+  useUpdateSequence,
+  useUsers,
+} from "@/lib/api"
 import { number, percent } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
 import type { Sequence, StepChannel } from "@/lib/types"
 import { StepChannelIcon, rate } from "./channel"
 import { NewSequenceDialog } from "./new-sequence-dialog"
+import { useDebounced } from "./use-debounced"
 
 type StatusFilter = "all" | Sequence["status"]
 
 export function SequencesTab() {
   const router = useRouter()
-  const sequences = useStore((s) => s.sequences)
-  const enrollments = useStore((s) => s.enrollments)
-  const updateSequence = useStore((s) => s.updateSequence)
-  const duplicateSequence = useStore((s) => s.duplicateSequence)
-  const deleteSequence = useStore((s) => s.deleteSequence)
-  const lookup = useLookup()
+  const me = useCurrentUser()
+  const writable = canWrite(me.role)
+  const { data: users } = useUsers()
+  const updateSequence = useUpdateSequence()
+  const duplicateSequence = useDuplicateSequence()
+  const deleteSequence = useDeleteSequence()
 
   const [query, setQuery] = useState("")
   const [status, setStatus] = useState<StatusFilter>("all")
-  const [toDelete, setToDelete] = useState<Sequence | null>(null)
+  const [toDelete, setToDelete] = useState<SequenceRecord | null>(null)
+  const q = useDebounced(query.trim())
 
-  const activeBySeq = useMemo(() => {
-    const map = new Map<string, number>()
-    for (const e of enrollments) if (e.status === "active") map.set(e.sequenceId, (map.get(e.sequenceId) ?? 0) + 1)
-    return map
-  }, [enrollments])
+  const statsQuery = useOutreachStats()
+  const totals = statsQuery.data
+  const list = useSequences({ q: q || undefined, status: status === "all" ? undefined : [status] })
+  const sequences = list.data?.data ?? []
+  const filtering = !!q || status !== "all"
 
-  const totals = useMemo(() => {
-    const t = sequences.reduce(
-      (acc, q) => ({
-        enrolled: acc.enrolled + q.stats.enrolled,
-        sent: acc.sent + q.stats.sent,
-        opened: acc.opened + q.stats.opened,
-        replied: acc.replied + q.stats.replied,
-        meetings: acc.meetings + q.stats.meetings,
-      }),
-      { enrolled: 0, sent: 0, opened: 0, replied: 0, meetings: 0 },
-    )
-    return { ...t, active: [...activeBySeq.values()].reduce((a, b) => a + b, 0) }
-  }, [sequences, activeBySeq])
+  const ownerOf = (s: SequenceRecord) =>
+    users?.find((u) => u.id === s.ownerId) ?? (s.ownerName ? { name: s.ownerName, avatarColor: "bg-muted-foreground" } : null)
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    return sequences.filter(
-      (s) =>
-        (status === "all" || s.status === status) &&
-        (!q || s.name.toLowerCase().includes(q) || (lookup.user(s.ownerId)?.name.toLowerCase().includes(q) ?? false)),
-    )
-  }, [sequences, query, status, lookup])
-
-  const toggleStatus = (s: Sequence) => {
+  const toggleStatus = (s: SequenceRecord) => {
     const next = s.status === "active" ? "paused" : "active"
-    if (next === "active" && s.steps.length === 0) {
-      toast.error("Add at least one step before activating")
-      return
-    }
-    updateSequence(s.id, { status: next })
-    toast.success(next === "active" ? "Sequence activated" : "Sequence paused", { description: s.name })
+    updateSequence.mutate(
+      { id: s.id, status: next },
+      {
+        onSuccess: () =>
+          toast.success(next === "active" ? "Sequence activated" : "Sequence paused", { description: s.name }),
+      },
+    )
   }
 
-  const duplicate = (s: Sequence) => {
-    const id = duplicateSequence(s.id)
-    toast.success("Sequence duplicated", {
-      description: `${s.name} (copy)`,
-      action: { label: "Open", onClick: () => router.push(`/outreach/${id}`) },
+  const duplicate = (s: SequenceRecord) => {
+    duplicateSequence.mutate(s.id, {
+      onSuccess: (copy) =>
+        toast.success("Sequence duplicated", {
+          description: copy.name,
+          action: { label: "Open", onClick: () => router.push(`/outreach/${copy.id}`) },
+        }),
     })
   }
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
-        <StatCard label="Enrolled" value={number(totals.enrolled)} icon={UsersIcon} hint={`${totals.active} currently active`} />
-        <StatCard label="Emails sent" value={number(totals.sent)} icon={SendIcon} hint={`${sequences.length} sequences`} />
-        <StatCard label="Open rate" value={percent(rate(totals.opened, totals.sent))} icon={EyeIcon} hint={`${number(totals.opened)} opens`} />
-        <StatCard label="Reply rate" value={percent(rate(totals.replied, totals.sent))} icon={ReplyIcon} hint={`${number(totals.replied)} replies`} />
-        <StatCard
-          label="Meetings booked"
-          value={number(totals.meetings)}
-          icon={CalendarCheckIcon}
-          hint={`${percent(rate(totals.meetings, totals.replied))} of replies`}
-        />
-      </div>
+      {statsQuery.isError ? (
+        <QueryError error={statsQuery.error} onRetry={() => statsQuery.refetch()} title="Couldn't load outreach stats" />
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+          {!totals ? (
+            Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-[6.5rem] rounded-xl" />)
+          ) : (
+            <>
+              <StatCard
+                label="Enrolled"
+                value={number(totals.enrolled)}
+                icon={UsersIcon}
+                hint={`${totals.activeEnrollments} currently active`}
+              />
+              <StatCard label="Emails sent" value={number(totals.sent)} icon={SendIcon} hint={`${totals.totalSequences} sequences`} />
+              <StatCard label="Open rate" value={percent(totals.openRate)} icon={EyeIcon} hint={`${number(totals.opened)} opens`} />
+              <StatCard label="Reply rate" value={percent(totals.replyRate)} icon={ReplyIcon} hint={`${number(totals.replied)} replies`} />
+              <StatCard
+                label="Meetings booked"
+                value={number(totals.meetings)}
+                icon={CalendarCheckIcon}
+                hint={`${percent(rate(totals.meetings, totals.replied))} of replies`}
+              />
+            </>
+          )}
+        </div>
+      )}
 
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
         <InputGroup className="sm:max-w-xs">
           <InputGroupAddon>
             <SearchIcon />
           </InputGroupAddon>
-          <InputGroupInput placeholder="Search sequences or owners…" value={query} onChange={(e) => setQuery(e.target.value)} />
+          <InputGroupInput placeholder="Search sequences…" value={query} onChange={(e) => setQuery(e.target.value)} />
         </InputGroup>
         <Select value={status} onValueChange={(v) => setStatus(v as StatusFilter)}>
           <SelectTrigger className="w-full sm:w-40">
@@ -136,16 +148,24 @@ export function SequencesTab() {
             <SelectItem value="draft">Draft</SelectItem>
           </SelectContent>
         </Select>
-        <div className="sm:ml-auto">
-          <NewSequenceDialog />
-        </div>
+        {writable && (
+          <div className="sm:ml-auto">
+            <NewSequenceDialog />
+          </div>
+        )}
       </div>
 
-      {filtered.length === 0 ? (
+      {list.isError ? (
+        <QueryError error={list.error} onRetry={() => list.refetch()} />
+      ) : list.isPending ? (
+        <Card className="py-0">
+          <TableSkeleton rows={5} />
+        </Card>
+      ) : sequences.length === 0 ? (
         <EmptyState
           icon={WorkflowIcon}
-          title={sequences.length === 0 ? "No sequences yet" : "No sequences match"}
-          description={sequences.length === 0 ? "Create your first multi-channel sequence." : "Try a different search or status filter."}
+          title={filtering ? "No sequences match" : "No sequences yet"}
+          description={filtering ? "Try a different search or status filter." : "Create your first multi-channel sequence."}
         />
       ) : (
         <Card className="py-0">
@@ -164,7 +184,7 @@ export function SequencesTab() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filtered.map((s) => {
+              {sequences.map((s) => {
                 const channels = [...new Set(s.steps.map((st) => st.channel))] as StepChannel[]
                 return (
                   <TableRow key={s.id}>
@@ -187,11 +207,11 @@ export function SequencesTab() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <OwnerLabel user={lookup.user(s.ownerId)} />
+                      <OwnerLabel user={ownerOf(s)} />
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
                       <div>{number(s.stats.enrolled)}</div>
-                      <div className="text-xs text-muted-foreground">{activeBySeq.get(s.id) ?? 0} active</div>
+                      <div className="text-xs text-muted-foreground">{s.activeEnrollments} active</div>
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{percent(rate(s.stats.opened, s.stats.sent))}</TableCell>
                     <TableCell className="text-right tabular-nums">{percent(rate(s.stats.replied, s.stats.sent))}</TableCell>
@@ -209,17 +229,21 @@ export function SequencesTab() {
                               <EyeIcon /> Open
                             </Link>
                           </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => toggleStatus(s)}>
-                            {s.status === "active" ? <PauseIcon /> : <PlayIcon />}
-                            {s.status === "active" ? "Pause" : "Activate"}
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => duplicate(s)}>
-                            <CopyIcon /> Duplicate
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem variant="destructive" onSelect={() => setToDelete(s)}>
-                            <Trash2Icon /> Delete
-                          </DropdownMenuItem>
+                          {writable && (
+                            <>
+                              <DropdownMenuItem onSelect={() => toggleStatus(s)}>
+                                {s.status === "active" ? <PauseIcon /> : <PlayIcon />}
+                                {s.status === "active" ? "Pause" : "Activate"}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onSelect={() => duplicate(s)}>
+                                <CopyIcon /> Duplicate
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem variant="destructive" onSelect={() => setToDelete(s)}>
+                                <Trash2Icon /> Delete
+                              </DropdownMenuItem>
+                            </>
+                          )}
                         </DropdownMenuContent>
                       </DropdownMenu>
                     </TableCell>
@@ -239,8 +263,7 @@ export function SequencesTab() {
         confirmLabel="Delete sequence"
         onConfirm={() => {
           if (!toDelete) return
-          deleteSequence(toDelete.id)
-          toast.success("Sequence deleted", { description: toDelete.name })
+          deleteSequence.mutate(toDelete.id)
           setToDelete(null)
         }}
       />

@@ -5,8 +5,8 @@ import { BellIcon, BotIcon, CheckCheckIcon, KanbanSquareIcon, MailIcon, RadioTow
 import { Button } from "@/components/ui/button"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { useMarkAllNotificationsRead, useMarkNotificationRead, useNotifications } from "@/lib/api"
 import { timeAgo } from "@/lib/format"
-import { useStore } from "@/lib/store"
 import type { AppNotification } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -20,9 +20,10 @@ const ICONS: Record<AppNotification["kind"], typeof BellIcon> = {
 
 export function Notifications() {
   const router = useRouter()
-  const notifications = useStore((s) => s.notifications)
-  const markRead = useStore((s) => s.markNotificationRead)
-  const markAll = useStore((s) => s.markAllNotificationsRead)
+  const { data } = useNotifications()
+  const markRead = useMarkNotificationRead()
+  const markAll = useMarkAllNotificationsRead()
+  const notifications = data?.data ?? []
   const unread = notifications.filter((n) => !n.read).length
 
   return (
@@ -40,20 +41,20 @@ export function Notifications() {
       <PopoverContent align="end" className="w-96 p-0">
         <div className="flex items-center justify-between border-b px-4 py-3">
           <div className="text-sm font-medium">Notifications</div>
-          <Button variant="ghost" size="xs" onClick={markAll} disabled={!unread}>
+          <Button variant="ghost" size="xs" onClick={() => markAll.mutate()} disabled={!unread || markAll.isPending}>
             <CheckCheckIcon /> Mark all read
           </Button>
         </div>
         <ScrollArea className="h-96">
           {notifications.length === 0 && <p className="p-6 text-center text-sm text-muted-foreground">You&apos;re all caught up.</p>}
           {notifications.map((n) => {
-            const Icon = ICONS[n.kind]
+            const Icon = ICONS[n.kind] ?? BellIcon
             return (
               <button
                 key={n.id}
                 className={cn("flex w-full gap-3 border-b px-4 py-3 text-left transition-colors hover:bg-muted/60", !n.read && "bg-primary/5")}
                 onClick={() => {
-                  markRead(n.id)
+                  if (!n.read) markRead.mutate(n.id)
                   if (n.href) router.push(n.href)
                 }}
               >

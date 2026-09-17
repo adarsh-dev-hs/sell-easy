@@ -4,9 +4,6 @@ import { useState } from "react"
 import { CheckIcon, CopyIcon } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
-import type { Role } from "@/lib/types"
-
-export const canManageOrg = (role?: Role) => role === "owner" || role === "admin"
 
 export const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
 

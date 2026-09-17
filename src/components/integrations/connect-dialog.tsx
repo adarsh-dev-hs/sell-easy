@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/dialog"
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { useStore } from "@/lib/store"
+import { ApiError, useConnectIntegration } from "@/lib/api"
 import type { Integration } from "@/lib/types"
 
 export function ConnectDialog({
@@ -34,29 +34,30 @@ export function ConnectDialog({
 }
 
 function ConnectForm({ integration, onDone }: { integration: Integration; onDone: () => void }) {
-  const connectIntegration = useStore((s) => s.connectIntegration)
+  const connect = useConnectIntegration()
   const [key, setKey] = useState("")
   const [touched, setTouched] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const error = key.trim().length < 8 ? "API key must be at least 8 characters." : null
-  const reconnect = integration.connected
+  const [serverError, setServerError] = useState<string | null>(null)
+  const busy = connect.isPending
+  const error = key.trim().length < 8 ? "API key must be at least 8 characters." : serverError
+  const reconnect = integration.connected || integration.status === "error"
 
-  const submit = async (e: React.FormEvent) => {
+  const submit = (e: React.FormEvent) => {
     e.preventDefault()
     setTouched(true)
     if (error) return
-    setBusy(true)
-    try {
-      await connectIntegration(integration.id, key.trim())
-      toast.success(`${integration.name} ${reconnect ? "reconnected" : "connected"}`, {
-        description: `Now feeding ${integration.feeds}.`,
-      })
-      onDone()
-    } catch {
-      toast.error(`Could not connect ${integration.name}`)
-    } finally {
-      setBusy(false)
-    }
+    connect.mutate(
+      { id: integration.id, apiKey: key.trim() },
+      {
+        onSuccess: (i) => {
+          toast.success(`${i.name} ${reconnect ? "reconnected" : "connected"}`, { description: `Now feeding ${i.feeds}.` })
+          onDone()
+        },
+        onError: (err) => {
+          if (err instanceof ApiError && err.status === 400) setServerError(err.fieldErrors.apiKey?.[0] ?? err.message)
+        },
+      },
+    )
   }
 
   return (
@@ -78,7 +79,10 @@ function ConnectForm({ integration, onDone }: { integration: Integration; onDone
             placeholder="Paste your API key"
             value={key}
             aria-invalid={touched && !!error}
-            onChange={(e) => setKey(e.target.value)}
+            onChange={(e) => {
+              setKey(e.target.value)
+              setServerError(null)
+            }}
             onBlur={() => setTouched(true)}
             disabled={busy}
           />

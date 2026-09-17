@@ -2,7 +2,6 @@
 
 import { Suspense, useMemo, useState } from "react"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
-import { startOfQuarter } from "date-fns"
 import {
   CloudUploadIcon,
   DollarSignIcon,
@@ -15,23 +14,25 @@ import {
   TableIcon,
   TrophyIcon,
 } from "lucide-react"
-import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { EmptyState } from "@/components/shared/empty-state"
 import { PageHeader } from "@/components/shared/page-header"
+import { QueryError, TableSkeleton } from "@/components/shared/query-state"
 import { StatCard } from "@/components/shared/stat-card"
-import { DealBoard } from "@/components/pipeline/deal-board"
+import { DealBoard, DealBoardSkeleton } from "@/components/pipeline/deal-board"
 import { DealSheet } from "@/components/pipeline/deal-sheet"
-import { DealTable } from "@/components/pipeline/deal-table"
-import { currentTime, isClosed } from "@/components/pipeline/deal-utils"
+import { DEFAULT_DEAL_SORT, type DealSort, dealSortParam, DealTable } from "@/components/pipeline/deal-table"
+import { currentTime } from "@/components/pipeline/deal-utils"
+import { useDebounced, useTeam } from "@/components/pipeline/hooks"
 import { NewDealDialog } from "@/components/pipeline/new-deal-dialog"
+import { canWrite, useCurrentUser, useDeals, usePipelineStats, useSyncCrm } from "@/lib/api"
 import { currency, percent } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
 
 export default function PipelinePage() {
   return (
@@ -46,20 +47,34 @@ function Pipeline() {
   const pathname = usePathname()
   const params = useSearchParams()
   const dealParam = params.get("deal")
-  const newOpen = params.get("new") === "1"
+  const user = useCurrentUser()
+  const writable = canWrite(user.role)
+  const newOpen = writable && params.get("new") === "1"
 
-  const deals = useStore((s) => s.deals)
-  const users = useStore((s) => s.users)
-  const currentUserId = useStore((s) => s.currentUserId)
-  const syncCrm = useStore((s) => s.syncCrm)
-  const lookup = useLookup()
+  const { sellers } = useTeam()
+  const syncCrm = useSyncCrm()
 
   const [nowMs] = useState(currentTime)
   const [query, setQuery] = useState("")
   const [owner, setOwner] = useState("all")
   const [hideClosed, setHideClosed] = useState(false)
   const [view, setView] = useState<"board" | "table">("board")
-  const [syncing, setSyncing] = useState(false)
+  const [tableSort, setTableSort] = useState<DealSort>(DEFAULT_DEAL_SORT)
+
+  const q = useDebounced(query.trim(), 250)
+  const ownerId = owner === "all" ? undefined : owner
+  const filters = useMemo(() => ({ q: q || undefined, ownerId }), [q, ownerId])
+
+  // Stats keep closed deals in scope (won / win rate), so only search + owner apply.
+  const { data: stats } = usePipelineStats(filters)
+  const dealsQuery = useDeals({
+    ...filters,
+    hideClosed: hideClosed || undefined,
+    pageSize: 1000,
+    sort: view === "board" ? "updatedAt:desc" : dealSortParam(tableSort),
+  })
+  const deals = dealsQuery.data?.data ?? []
+  const unfiltered = !q && !ownerId && !hideClosed
 
   const setParam = (key: "deal" | "new", value: string | null) => {
     const next = new URLSearchParams(params.toString())
@@ -71,59 +86,8 @@ function Pipeline() {
   }
   const openDeal = (id: string) => setParam("deal", id)
 
-  const sellers = useMemo(() => users.filter((u) => u.role !== "viewer"), [users])
-
-  // Search + owner filters (stats use these, so closed deals stay in for won / win rate)
-  const scoped = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    return deals.filter((d) => {
-      if (owner !== "all" && d.ownerId !== owner) return false
-      if (!q) return true
-      const account = lookup.account(d.accountId)
-      return (
-        d.name.toLowerCase().includes(q) ||
-        (account?.name.toLowerCase().includes(q) ?? false) ||
-        (account?.domain.toLowerCase().includes(q) ?? false) ||
-        (d.crmId?.toLowerCase().includes(q) ?? false)
-      )
-    })
-  }, [deals, owner, query, lookup])
-
-  const visible = useMemo(() => (hideClosed ? scoped.filter((d) => !isClosed(d.stage)) : scoped), [scoped, hideClosed])
-
-  const stats = useMemo(() => {
-    const open = scoped.filter((d) => !isClosed(d.stage))
-    const won = scoped.filter((d) => d.stage === "closed_won")
-    const lost = scoped.filter((d) => d.stage === "closed_lost")
-    const qStart = startOfQuarter(nowMs).getTime()
-    const wonQ = won.filter((d) => new Date(d.closeDate).getTime() >= qStart)
-    return {
-      open: open.reduce((s, d) => s + d.amount, 0),
-      openCount: open.length,
-      weighted: open.reduce((s, d) => s + (d.amount * d.probability) / 100, 0),
-      wonQuarter: wonQ.reduce((s, d) => s + d.amount, 0),
-      wonQuarterCount: wonQ.length,
-      winRate: won.length + lost.length ? (won.length / (won.length + lost.length)) * 100 : 0,
-      closedCount: won.length + lost.length,
-      avgDeal: won.length ? won.reduce((s, d) => s + d.amount, 0) / won.length : 0,
-      wonCount: won.length,
-      unsynced: scoped.filter((d) => !d.syncedAt).length,
-    }
-  }, [scoped, nowMs])
-
-  const handleSync = async () => {
-    setSyncing(true)
-    try {
-      const n = await syncCrm()
-      toast.success(`${n} deal${n === 1 ? "" : "s"} pushed to HubSpot`, {
-        description: n ? "CRM records created and updated" : "Everything was already in sync",
-      })
-    } catch {
-      toast.error("CRM sync failed")
-    } finally {
-      setSyncing(false)
-    }
-  }
+  const wonCount = stats?.byStage.find((s) => s.stage === "closed_won")?.count ?? 0
+  const stat = (v: string | undefined) => v ?? <Skeleton className="h-8 w-24" />
 
   return (
     <>
@@ -132,23 +96,52 @@ function Pipeline() {
         description="Track every opportunity from discovery to close, synced with your CRM."
         actions={
           <>
-            <Button variant="outline" onClick={handleSync} disabled={syncing}>
-              {syncing ? <Loader2Icon className="animate-spin" /> : <CloudUploadIcon />}
-              {syncing ? "Syncing…" : "Sync to CRM"}
-            </Button>
-            <Button onClick={() => setParam("new", "1")}>
-              <PlusIcon /> New deal
-            </Button>
+            {writable && (
+              <>
+                <Button variant="outline" onClick={() => syncCrm.mutate()} disabled={syncCrm.isPending}>
+                  {syncCrm.isPending ? <Loader2Icon className="animate-spin" /> : <CloudUploadIcon />}
+                  {syncCrm.isPending ? "Syncing…" : "Sync to CRM"}
+                </Button>
+                <Button onClick={() => setParam("new", "1")}>
+                  <PlusIcon /> New deal
+                </Button>
+              </>
+            )}
           </>
         }
       />
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
-        <StatCard label="Open pipeline" value={currency(stats.open)} icon={DollarSignIcon} hint={`${stats.openCount} open deals`} />
-        <StatCard label="Weighted pipeline" value={currency(stats.weighted)} icon={ScaleIcon} hint="Amount × probability" />
-        <StatCard label="Won this quarter" value={currency(stats.wonQuarter)} icon={TrophyIcon} hint={`${stats.wonQuarterCount} deals closed`} />
-        <StatCard label="Win rate" value={percent(stats.winRate, 0)} icon={PercentIcon} hint={`${stats.closedCount} closed deals`} />
-        <StatCard label="Avg deal size" value={currency(stats.avgDeal)} icon={KanbanSquareIcon} hint={`Across ${stats.wonCount} won deals`} />
+        <StatCard
+          label="Open pipeline"
+          value={stat(stats && currency(stats.openPipeline))}
+          icon={DollarSignIcon}
+          hint={stats && `${stats.openCount} open deals`}
+        />
+        <StatCard
+          label="Weighted pipeline"
+          value={stat(stats && currency(stats.weightedPipeline))}
+          icon={ScaleIcon}
+          hint="Amount × probability"
+        />
+        <StatCard
+          label="Won this quarter"
+          value={stat(stats && currency(stats.wonThisQuarter))}
+          icon={TrophyIcon}
+          hint={stats && `${stats.wonThisQuarterCount} deals closed`}
+        />
+        <StatCard
+          label="Win rate"
+          value={stat(stats && percent(stats.winRate, 0))}
+          icon={PercentIcon}
+          hint={stats && `${stats.closedCount} closed deals`}
+        />
+        <StatCard
+          label="Avg deal size"
+          value={stat(stats && currency(stats.avgDealSize))}
+          icon={KanbanSquareIcon}
+          hint={stats && `Across ${wonCount} won deals`}
+        />
       </div>
 
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
@@ -169,10 +162,10 @@ function Pipeline() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All owners</SelectItem>
-              <SelectItem value={currentUserId}>My deals</SelectItem>
+              <SelectItem value={user.id}>My deals</SelectItem>
               <SelectSeparator />
               {sellers
-                .filter((u) => u.id !== currentUserId)
+                .filter((u) => u.id !== user.id)
                 .map((u) => (
                   <SelectItem key={u.id} value={u.id}>
                     {u.name}
@@ -186,7 +179,7 @@ function Pipeline() {
               Hide closed
             </Label>
           </div>
-          {stats.unsynced > 0 && (
+          {!!stats?.unsynced && (
             <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <span className="size-1.5 rounded-full bg-amber-500" />
               {stats.unsynced} unsynced
@@ -210,25 +203,35 @@ function Pipeline() {
         </ToggleGroup>
       </div>
 
-      {deals.length === 0 ? (
+      {dealsQuery.isError && !dealsQuery.data ? (
+        <QueryError error={dealsQuery.error} onRetry={() => dealsQuery.refetch()} />
+      ) : !dealsQuery.data ? (
+        view === "board" ? (
+          <DealBoardSkeleton />
+        ) : (
+          <TableSkeleton className="rounded-xl border bg-card" />
+        )
+      ) : unfiltered && dealsQuery.data.meta.total === 0 ? (
         <EmptyState
           icon={KanbanSquareIcon}
           title="No deals yet"
           description="Create your first deal or let the agent open deals from high-intent signals."
           action={
-            <Button onClick={() => setParam("new", "1")}>
-              <PlusIcon /> New deal
-            </Button>
+            writable && (
+              <Button onClick={() => setParam("new", "1")}>
+                <PlusIcon /> New deal
+              </Button>
+            )
           }
         />
       ) : view === "board" ? (
-        <DealBoard deals={visible} nowMs={nowMs} onOpen={openDeal} />
+        <DealBoard deals={deals} nowMs={nowMs} onOpen={openDeal} canEdit={writable} />
       ) : (
-        <DealTable deals={visible} nowMs={nowMs} onOpen={openDeal} />
+        <DealTable deals={deals} nowMs={nowMs} sort={tableSort} onSortChange={setTableSort} onOpen={openDeal} />
       )}
 
       <DealSheet dealId={dealParam} onClose={() => setParam("deal", null)} />
-      <NewDealDialog open={newOpen} onOpenChange={(o) => setParam("new", o ? "1" : null)} onCreated={openDeal} />
+      {writable && <NewDealDialog open={newOpen} onOpenChange={(o) => setParam("new", o ? "1" : null)} onCreated={openDeal} />}
     </>
   )
 }

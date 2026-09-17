@@ -1,12 +1,13 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import Link from "next/link"
 import { ExternalLinkIcon, ListPlusIcon, Loader2Icon, MailCheckIcon, SaveIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ActivityTimeline } from "@/components/accounts/activity-timeline"
 import { CompanyAvatar, OwnerLabel, PersonAvatar } from "@/components/shared/avatars"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
+import { QueryError } from "@/components/shared/query-state"
 import { humanize, StatusBadge } from "@/components/shared/status"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -15,67 +16,123 @@ import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  canWrite,
+  type ContactRecord,
+  useContact,
+  useContactActivities,
+  useContactEnrollments,
+  useCurrentUser,
+  useDeleteContact,
+  useUpdateContact,
+  useUsers,
+  useVerifyEmails,
+} from "@/lib/api"
 import { fullName, shortDate, timeAgo } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
 import type { Contact } from "@/lib/types"
 import { CONTACT_STATUSES } from "./options"
 import { EnrollDialog } from "./enroll-dialog"
 
 export function ContactSheet({ contactId, onOpenChange }: { contactId: string | null; onOpenChange: (open: boolean) => void }) {
-  const contacts = useStore((s) => s.contacts)
-  const contact = useMemo(() => contacts.find((c) => c.id === contactId), [contacts, contactId])
   return (
-    <Sheet open={!!contact} onOpenChange={onOpenChange}>
+    <Sheet open={!!contactId} onOpenChange={onOpenChange}>
       <SheetContent className="w-full gap-0 sm:max-w-xl">
-        {contact && <ContactDetail key={contact.id} contact={contact} onClose={() => onOpenChange(false)} />}
+        {contactId && <ContactLoader key={contactId} contactId={contactId} onClose={() => onOpenChange(false)} />}
       </SheetContent>
     </Sheet>
   )
 }
 
-function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => void }) {
-  const lookup = useLookup()
-  const enrollments = useStore((s) => s.enrollments)
-  const activities = useStore((s) => s.activities)
-  const updateContact = useStore((s) => s.updateContact)
-  const verifyEmails = useStore((s) => s.verifyEmails)
-  const deleteContacts = useStore((s) => s.deleteContacts)
+function ContactLoader({ contactId, onClose }: { contactId: string; onClose: () => void }) {
+  const { data: contact, error, isLoading, refetch } = useContact(contactId)
+  if (isLoading) {
+    return (
+      <>
+        <SheetHeader className="border-b pr-12">
+          <SheetTitle className="sr-only">Loading contact</SheetTitle>
+          <div className="flex items-center gap-3">
+            <Skeleton className="size-11 rounded-full" />
+            <div className="flex-1 space-y-2">
+              <Skeleton className="h-5 w-40" />
+              <Skeleton className="h-4 w-56" />
+            </div>
+          </div>
+        </SheetHeader>
+        <div className="space-y-3 p-4">
+          <Skeleton className="h-8 w-full" />
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-24 w-full" />
+        </div>
+      </>
+    )
+  }
+  if (error || !contact) {
+    return (
+      <>
+        <SheetHeader className="border-b pr-12">
+          <SheetTitle>Contact</SheetTitle>
+        </SheetHeader>
+        <div className="p-4">
+          <QueryError error={error ?? new Error("Contact not found")} onRetry={() => refetch()} title="Couldn't load contact" />
+        </div>
+      </>
+    )
+  }
+  return <ContactDetail contact={contact} onClose={onClose} />
+}
 
-  const [form, setForm] = useState({ title: contact.title, email: contact.email, phone: contact.phone ?? "" })
-  const [verifying, setVerifying] = useState(false)
+type EditableField = "title" | "email" | "phone"
+
+function ContactDetail({ contact, onClose }: { contact: ContactRecord; onClose: () => void }) {
+  const me = useCurrentUser()
+  const writable = canWrite(me.role)
+  const { data: users } = useUsers()
+  const { data: enrollments, isLoading: enrollmentsLoading } = useContactEnrollments(contact.id)
+  const { data: activityPage, isLoading: activityLoading } = useContactActivities(contact.id)
+  const updateContact = useUpdateContact()
+  const verifyEmails = useVerifyEmails()
+  const deleteContact = useDeleteContact()
+
+  // Local edits layered over the server record (so server-side changes, e.g. a found email, show through).
+  const [edits, setEdits] = useState<Partial<Record<EditableField, string>>>({})
   const [enrollOpen, setEnrollOpen] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
 
-  const account = lookup.account(contact.accountId)
-  const owner = lookup.user(contact.ownerId)
-  const myEnrollments = useMemo(() => enrollments.filter((e) => e.contactId === contact.id), [enrollments, contact.id])
-  const myActivity = useMemo(() => activities.filter((a) => a.contactId === contact.id), [activities, contact.id])
+  const base: Record<EditableField, string> = { title: contact.title, email: contact.email, phone: contact.phone ?? "" }
+  const form: Record<EditableField, string> = {
+    title: edits.title ?? base.title,
+    email: edits.email ?? base.email,
+    phone: edits.phone ?? base.phone,
+  }
+  const setField = (k: EditableField, v: string) => setEdits((e) => ({ ...e, [k]: v }))
+  const dirty = (Object.keys(base) as EditableField[]).some((k) => form[k] !== base[k])
+
+  const account = contact.account
+  const owner = users?.find((u) => u.id === contact.ownerId)
   const name = fullName(contact)
 
-  const dirty = form.title !== contact.title || form.email !== contact.email || form.phone !== (contact.phone ?? "")
-
   const save = () => {
-    const emailChanged = form.email.trim() !== contact.email
-    updateContact(contact.id, {
-      title: form.title.trim(),
-      email: form.email.trim(),
-      phone: form.phone.trim() || undefined,
-      ...(emailChanged ? { emailStatus: form.email.trim() ? "unverified" : "missing" } : {}),
-    })
-    toast.success("Contact updated")
+    updateContact.mutate(
+      { id: contact.id, title: form.title.trim(), email: form.email.trim(), phone: form.phone.trim() },
+      {
+        onSuccess: () => {
+          setEdits({})
+          toast.success("Contact updated")
+        },
+      },
+    )
   }
 
-  const verify = async () => {
-    setVerifying(true)
-    try {
-      await verifyEmails([contact.id])
-      const updated = useStore.getState().contacts.find((c) => c.id === contact.id)
-      if (updated) setForm((f) => ({ ...f, email: updated.email }))
-      if (updated?.emailStatus === "verified") toast.success("Email verified", { description: updated.email })
-      else toast.error("Email is invalid", { description: updated?.email })
-    } finally {
-      setVerifying(false)
-    }
+  const verify = () => {
+    verifyEmails.mutate([contact.id], {
+      onSuccess: (r) => {
+        setEdits((e) => ({ ...e, email: undefined }))
+        if (r.verified) toast.success(r.found ? "Email found and verified" : "Email verified")
+        else if (r.invalid) toast.error("Email is invalid")
+        else toast.info("No verified email found")
+      },
+    })
   }
 
   return (
@@ -86,7 +143,7 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
           <div className="min-w-0">
             <SheetTitle className="truncate text-lg">{name}</SheetTitle>
             <SheetDescription className="truncate">
-              {contact.title} · {contact.seniority} · {contact.department}
+              {[contact.title, contact.seniority, contact.department].filter(Boolean).join(" · ")}
             </SheetDescription>
           </div>
         </div>
@@ -99,13 +156,17 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
 
       <div className="flex-1 space-y-6 overflow-y-auto p-4">
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" onClick={verify} disabled={verifying}>
-            {verifying ? <Loader2Icon className="animate-spin" /> : <MailCheckIcon />}
-            {contact.emailStatus === "missing" ? "Find email" : "Verify email"}
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => setEnrollOpen(true)}>
-            <ListPlusIcon /> Enroll in sequence
-          </Button>
+          {writable && (
+            <>
+              <Button variant="outline" size="sm" onClick={verify} disabled={verifyEmails.isPending}>
+                {verifyEmails.isPending ? <Loader2Icon className="animate-spin" /> : <MailCheckIcon />}
+                {contact.emailStatus === "missing" ? "Find email" : "Verify email"}
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setEnrollOpen(true)}>
+                <ListPlusIcon /> Enroll in sequence
+              </Button>
+            </>
+          )}
           {contact.linkedinUrl && (
             <Button variant="outline" size="sm" asChild>
               <a href={contact.linkedinUrl} target="_blank" rel="noreferrer">
@@ -113,9 +174,11 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
               </a>
             </Button>
           )}
-          <Button variant="destructive" size="sm" className="ml-auto" onClick={() => setConfirmOpen(true)}>
-            <Trash2Icon /> Delete
-          </Button>
+          {writable && (
+            <Button variant="destructive" size="sm" className="ml-auto" onClick={() => setConfirmOpen(true)}>
+              <Trash2Icon /> Delete
+            </Button>
+          )}
         </div>
 
         <section className="space-y-3">
@@ -123,26 +186,35 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
           <FieldGroup className="gap-3">
             <Field>
               <FieldLabel htmlFor="cs-title">Title</FieldLabel>
-              <Input id="cs-title" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+              <Input id="cs-title" disabled={!writable} value={form.title} onChange={(e) => setField("title", e.target.value)} />
             </Field>
             <div className="grid gap-3 sm:grid-cols-2">
               <Field>
                 <FieldLabel htmlFor="cs-email">Email</FieldLabel>
-                <Input id="cs-email" type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+                <Input
+                  id="cs-email"
+                  type="email"
+                  disabled={!writable}
+                  value={form.email}
+                  onChange={(e) => setField("email", e.target.value)}
+                />
               </Field>
               <Field>
                 <FieldLabel htmlFor="cs-phone">Phone</FieldLabel>
-                <Input id="cs-phone" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+                <Input id="cs-phone" disabled={!writable} value={form.phone} onChange={(e) => setField("phone", e.target.value)} />
               </Field>
             </div>
             <Field>
               <FieldLabel>Status</FieldLabel>
               <Select
                 value={contact.status}
-                onValueChange={(v) => {
-                  updateContact(contact.id, { status: v as Contact["status"] })
-                  toast.success(`Status set to ${humanize(v)}`)
-                }}
+                disabled={!writable || updateContact.isPending}
+                onValueChange={(v) =>
+                  updateContact.mutate(
+                    { id: contact.id, status: v as Contact["status"] },
+                    { onSuccess: () => toast.success(`Status set to ${humanize(v)}`) },
+                  )
+                }
               >
                 <SelectTrigger className="w-full">
                   <SelectValue />
@@ -157,20 +229,18 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
               </Select>
             </Field>
           </FieldGroup>
-          <div className="flex justify-end gap-2">
-            {dirty && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setForm({ title: contact.title, email: contact.email, phone: contact.phone ?? "" })}
-              >
-                Reset
+          {writable && (
+            <div className="flex justify-end gap-2">
+              {dirty && (
+                <Button variant="ghost" size="sm" onClick={() => setEdits({})}>
+                  Reset
+                </Button>
+              )}
+              <Button size="sm" disabled={!dirty || updateContact.isPending} onClick={save}>
+                {updateContact.isPending ? <Loader2Icon className="animate-spin" /> : <SaveIcon />} Save changes
               </Button>
-            )}
-            <Button size="sm" disabled={!dirty} onClick={save}>
-              <SaveIcon /> Save changes
-            </Button>
-          </div>
+            </div>
+          )}
         </section>
 
         <Separator />
@@ -205,12 +275,14 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
 
         <section className="space-y-3">
           <h3 className="text-sm font-medium">Sequence enrollments</h3>
-          {myEnrollments.length === 0 ? (
+          {enrollmentsLoading ? (
+            <Skeleton className="h-14 w-full" />
+          ) : !enrollments?.length ? (
             <p className="text-sm text-muted-foreground">Not enrolled in any sequence.</p>
           ) : (
             <div className="divide-y rounded-lg border">
-              {myEnrollments.map((e) => {
-                const seq = lookup.sequence(e.sequenceId)
+              {enrollments.map((e) => {
+                const seq = e.sequence
                 return (
                   <div key={e.id} className="flex items-center gap-3 p-3">
                     <div className="min-w-0 flex-1">
@@ -218,7 +290,7 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
                         {seq?.name ?? "Deleted sequence"}
                       </Link>
                       <div className="text-xs text-muted-foreground">
-                        Step {Math.min(e.currentStep + 1, seq?.steps.length ?? e.currentStep + 1)} of {seq?.steps.length ?? "?"} · enrolled{" "}
+                        Step {Math.min(e.currentStep + 1, seq?.stepCount ?? e.currentStep + 1)} of {seq?.stepCount ?? "?"} · enrolled{" "}
                         {timeAgo(e.enrolledAt)}
                       </div>
                     </div>
@@ -234,11 +306,18 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
 
         <section className="space-y-3">
           <h3 className="text-sm font-medium">Activity</h3>
-          <ActivityTimeline items={myActivity} emptyText="No activity for this contact yet." />
+          {activityLoading ? (
+            <div className="space-y-3">
+              <Skeleton className="h-12 w-full" />
+              <Skeleton className="h-12 w-full" />
+            </div>
+          ) : (
+            <ActivityTimeline items={activityPage?.data ?? []} emptyText="No activity for this contact yet." />
+          )}
         </section>
       </div>
 
-      <EnrollDialog open={enrollOpen} onOpenChange={setEnrollOpen} contactIds={[contact.id]} />
+      <EnrollDialog open={enrollOpen} onOpenChange={setEnrollOpen} target={{ kind: "contacts", contactIds: [contact.id] }} />
       <ConfirmDialog
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
@@ -246,8 +325,7 @@ function ContactDetail({ contact, onClose }: { contact: Contact; onClose: () => 
         description="This removes the contact and any sequence enrollments. This cannot be undone."
         confirmLabel="Delete contact"
         onConfirm={() => {
-          deleteContacts([contact.id])
-          toast.success(`Deleted ${name}`)
+          deleteContact.mutate(contact.id)
           onClose()
         }}
       />

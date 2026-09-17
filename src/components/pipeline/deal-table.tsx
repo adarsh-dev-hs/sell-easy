@@ -1,57 +1,53 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useMemo } from "react"
 import { ArrowDownIcon, ArrowUpDownIcon, ArrowUpIcon, CheckCircle2Icon } from "lucide-react"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { CompanyAvatar, OwnerLabel } from "@/components/shared/avatars"
 import { StatusBadge } from "@/components/shared/status"
-import { DEAL_STAGE_LABEL, DEAL_STAGES } from "@/lib/constants"
+import type { DealRecord } from "@/lib/api"
+import { DEAL_STAGE_LABEL } from "@/lib/constants"
 import { currency, shortDate, timeAgo } from "@/lib/format"
-import { useLookup } from "@/lib/store"
-import type { Deal } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { isOverdue } from "./deal-utils"
+import { useTeam } from "./hooks"
 
-type SortKey = "name" | "account" | "stage" | "amount" | "probability" | "closeDate" | "owner" | "crm" | "updatedAt"
+/** Columns sortable by the API (`sort=field:dir`). */
+type ServerSortKey = "name" | "stage" | "amount" | "probability" | "closeDate" | "updatedAt"
+/** `account` is sorted client-side on the loaded rows (the API can't sort by account name). */
+export type DealSortKey = ServerSortKey | "account"
+export type DealSort = { key: DealSortKey; dir: 1 | -1 }
 
-const STAGE_INDEX = Object.fromEntries(DEAL_STAGES.map((s, i) => [s.id, i]))
+export const DEFAULT_DEAL_SORT: DealSort = { key: "updatedAt", dir: -1 }
 
-export function DealTable({ deals, nowMs, onOpen }: { deals: Deal[]; nowMs: number; onOpen: (id: string) => void }) {
-  const lookup = useLookup()
-  const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "updatedAt", dir: -1 })
+/** Server `sort` param for a table sort (account-name sorting falls back to the default order). */
+export const dealSortParam = (sort: DealSort) =>
+  sort.key === "account" ? "updatedAt:desc" : `${sort.key}:${sort.dir === 1 ? "asc" : "desc"}`
+
+export const nextDealSort = (s: DealSort, key: DealSortKey): DealSort =>
+  s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === "amount" || key === "updatedAt" ? -1 : 1 }
+
+export function DealTable({
+  deals,
+  nowMs,
+  sort,
+  onSortChange,
+  onOpen,
+}: {
+  deals: DealRecord[]
+  nowMs: number
+  sort: DealSort
+  onSortChange: (sort: DealSort) => void
+  onOpen: (id: string) => void
+}) {
+  const { byId } = useTeam()
 
   const rows = useMemo(() => {
-    const value = (d: Deal): string | number => {
-      switch (sort.key) {
-        case "name":
-          return d.name.toLowerCase()
-        case "account":
-          return (lookup.account(d.accountId)?.name ?? "").toLowerCase()
-        case "stage":
-          return STAGE_INDEX[d.stage]
-        case "amount":
-          return d.amount
-        case "probability":
-          return d.probability
-        case "closeDate":
-          return d.closeDate
-        case "owner":
-          return (lookup.user(d.ownerId)?.name ?? "").toLowerCase()
-        case "crm":
-          return d.syncedAt ? 1 : 0
-        case "updatedAt":
-          return d.updatedAt
-      }
-    }
-    return [...deals].sort((a, b) => {
-      const va = value(a)
-      const vb = value(b)
-      return (va < vb ? -1 : va > vb ? 1 : 0) * sort.dir
-    })
-  }, [deals, sort, lookup])
+    if (sort.key !== "account") return deals
+    return [...deals].sort((a, b) => (a.account?.name ?? "").localeCompare(b.account?.name ?? "") * sort.dir)
+  }, [deals, sort])
 
-  const toggle = (key: SortKey) =>
-    setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === "amount" || key === "updatedAt" ? -1 : 1 }))
+  const toggle = (key: DealSortKey) => onSortChange(nextDealSort(sort, key))
 
   return (
     <div className="overflow-hidden rounded-xl border bg-card">
@@ -64,8 +60,8 @@ export function DealTable({ deals, nowMs, onOpen }: { deals: Deal[]; nowMs: numb
             <SortHead sort={sort} onToggle={toggle} k="amount" className="text-right">Amount</SortHead>
             <SortHead sort={sort} onToggle={toggle} k="probability" className="text-right">Prob.</SortHead>
             <SortHead sort={sort} onToggle={toggle} k="closeDate">Close date</SortHead>
-            <SortHead sort={sort} onToggle={toggle} k="owner">Owner</SortHead>
-            <SortHead sort={sort} onToggle={toggle} k="crm">CRM</SortHead>
+            <TableHead>Owner</TableHead>
+            <TableHead>CRM</TableHead>
             <SortHead sort={sort} onToggle={toggle} k="updatedAt">Updated</SortHead>
           </TableRow>
         </TableHeader>
@@ -77,46 +73,39 @@ export function DealTable({ deals, nowMs, onOpen }: { deals: Deal[]; nowMs: numb
               </TableCell>
             </TableRow>
           )}
-          {rows.map((d) => {
-            const account = lookup.account(d.accountId)
-            return (
-              <TableRow key={d.id} className="cursor-pointer" onClick={() => onOpen(d.id)}>
-                <TableCell className="max-w-64 truncate font-medium">{d.name}</TableCell>
-                <TableCell>
-                  <div className="flex items-center gap-2">
-                    <CompanyAvatar name={account?.name ?? "?"} className="size-6 text-[10px]" />
-                    <span className="max-w-40 truncate">{account?.name ?? "—"}</span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <StatusBadge
-                    status={d.stage}
-                    label={DEAL_STAGE_LABEL[d.stage]}
-                    tone={d.stage.startsWith("closed") ? undefined : "info"}
-                  />
-                </TableCell>
-                <TableCell className="text-right font-medium tabular-nums">{currency(d.amount, false)}</TableCell>
-                <TableCell className="text-right tabular-nums">{d.probability}%</TableCell>
-                <TableCell className={cn(isOverdue(d, nowMs) && "font-medium text-rose-600 dark:text-rose-400")}>
-                  {shortDate(d.closeDate)}
-                </TableCell>
-                <TableCell>
-                  <OwnerLabel user={lookup.user(d.ownerId)} />
-                </TableCell>
-                <TableCell>
-                  <div className="flex items-center gap-1.5 text-xs">
-                    {d.syncedAt ? (
-                      <CheckCircle2Icon className="size-3.5 text-emerald-600 dark:text-emerald-400" />
-                    ) : (
-                      <span className="size-1.5 rounded-full bg-amber-500" />
-                    )}
-                    <span className={cn("font-mono", !d.crmId && "text-muted-foreground")}>{d.crmId ?? "Not created"}</span>
-                  </div>
-                </TableCell>
-                <TableCell className="text-muted-foreground">{timeAgo(d.updatedAt)}</TableCell>
-              </TableRow>
-            )
-          })}
+          {rows.map((d) => (
+            <TableRow key={d.id} className="cursor-pointer" onClick={() => onOpen(d.id)}>
+              <TableCell className="max-w-64 truncate font-medium">{d.name}</TableCell>
+              <TableCell>
+                <div className="flex items-center gap-2">
+                  <CompanyAvatar name={d.account?.name ?? "?"} className="size-6 text-[10px]" />
+                  <span className="max-w-40 truncate">{d.account?.name ?? "—"}</span>
+                </div>
+              </TableCell>
+              <TableCell>
+                <StatusBadge status={d.stage} label={DEAL_STAGE_LABEL[d.stage]} tone={d.stage.startsWith("closed") ? undefined : "info"} />
+              </TableCell>
+              <TableCell className="text-right font-medium tabular-nums">{currency(d.amount, false)}</TableCell>
+              <TableCell className="text-right tabular-nums">{d.probability}%</TableCell>
+              <TableCell className={cn(isOverdue(d, nowMs) && "font-medium text-rose-600 dark:text-rose-400")}>
+                {shortDate(d.closeDate)}
+              </TableCell>
+              <TableCell>
+                <OwnerLabel user={byId.get(d.ownerId)} />
+              </TableCell>
+              <TableCell>
+                <div className="flex items-center gap-1.5 text-xs">
+                  {d.syncedAt ? (
+                    <CheckCircle2Icon className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+                  ) : (
+                    <span className="size-1.5 rounded-full bg-amber-500" />
+                  )}
+                  <span className={cn("font-mono", !d.crmId && "text-muted-foreground")}>{d.crmId ?? "Not created"}</span>
+                </div>
+              </TableCell>
+              <TableCell className="text-muted-foreground">{timeAgo(d.updatedAt)}</TableCell>
+            </TableRow>
+          ))}
         </TableBody>
       </Table>
     </div>
@@ -130,11 +119,11 @@ function SortHead({
   sort,
   onToggle,
 }: {
-  k: SortKey
+  k: DealSortKey
   children: React.ReactNode
   className?: string
-  sort: { key: SortKey; dir: 1 | -1 }
-  onToggle: (k: SortKey) => void
+  sort: DealSort
+  onToggle: (k: DealSortKey) => void
 }) {
   const right = className?.includes("text-right")
   return (

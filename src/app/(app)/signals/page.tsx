@@ -1,6 +1,6 @@
 "use client"
 
-import { Suspense, useMemo, useState } from "react"
+import { Suspense, useState } from "react"
 import Link from "next/link"
 import { useSearchParams } from "next/navigation"
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts"
@@ -10,6 +10,7 @@ import {
   ChevronRightIcon,
   ClockIcon,
   CpuIcon,
+  Loader2Icon,
   PlusIcon,
   RadioTowerIcon,
   SearchIcon,
@@ -17,7 +18,6 @@ import {
   SparklesIcon,
   ZapIcon,
 } from "lucide-react"
-import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -37,40 +37,63 @@ import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Slider } from "@/components/ui/slider"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
 import { RunSummary } from "@/components/agent/run-timeline"
 import { useRunToast } from "@/components/agent/run-toast"
+import { AccountPicker, type PickedAccount } from "@/components/signals/account-picker"
+import { useDebounced } from "@/components/signals/use-debounced"
 import { CompanyAvatar } from "@/components/shared/avatars"
 import { EmptyState } from "@/components/shared/empty-state"
 import { PageHeader } from "@/components/shared/page-header"
+import { QueryError, TableSkeleton } from "@/components/shared/query-state"
 import { ScoreBar, TierBadge } from "@/components/shared/score"
 import { StatCard } from "@/components/shared/stat-card"
 import { SignalIcon, StatusBadge } from "@/components/shared/status"
+import {
+  canWrite,
+  type SignalFilters,
+  type SignalRecord,
+  useAccountContacts,
+  useAgentSettings,
+  useCurrentUser,
+  useIngestSignal,
+  useMeta,
+  usePlaybooks,
+  useProcessPending,
+  useProcessSignal,
+  useSignal,
+  useSignals,
+  useSignalStats,
+  useSimulateSignal,
+} from "@/lib/api"
 import { SIGNAL_LABELS, SIGNAL_SOURCES } from "@/lib/constants"
 import { dateTime, fullName, timeAgo } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
-import type { Signal, SignalType } from "@/lib/types"
+import type { SignalType } from "@/lib/types"
+import { cn } from "@/lib/utils"
 
 const SIGNAL_TYPES = Object.keys(SIGNAL_LABELS) as SignalType[]
-const ALL_SOURCES = Array.from(new Set(Object.values(SIGNAL_SOURCES).flat())).sort()
 const PAGE_SIZE = 25
-const DAY = 86_400_000
-/** Wall-clock read, kept outside render bodies (memoized per data change). */
-const currentTime = () => Date.now()
 
 const RANGES = {
-  "24h": { label: "Last 24h", ms: DAY },
-  "7d": { label: "Last 7 days", ms: 7 * DAY },
-  "30d": { label: "Last 30 days", ms: 30 * DAY },
-  all: { label: "All time", ms: Infinity },
+  "24h": { label: "Last 24h", days: 1 },
+  "7d": { label: "Last 7 days", days: 7 },
+  "30d": { label: "Last 30 days", days: 30 },
+  all: { label: "All time", days: undefined },
 } as const
 type RangeKey = keyof typeof RANGES
 
 const typeChart = {
   count: { label: "Signals", color: "var(--chart-1)" },
 } satisfies ChartConfig
+
+/** Sources per signal type — served by the API, with the local constants as a fallback. */
+function useSignalSources() {
+  const { data } = useMeta()
+  return data?.signalSources ?? SIGNAL_SOURCES
+}
 
 // ---------------------------------------------------------------------------
 // Ingest dialog
@@ -79,53 +102,58 @@ const typeChart = {
 const NONE = "__none__"
 
 function IngestSignalDialog() {
-  const accounts = useStore((s) => s.accounts)
-  const contacts = useStore((s) => s.contacts)
-  const ingestSignal = useStore((s) => s.ingestSignal)
+  const sources = useSignalSources()
+  const ingest = useIngestSignal()
   const showRun = useRunToast()
 
   const [open, setOpen] = useState(false)
   const [type, setType] = useState<SignalType>("intent_topic")
-  const [accountId, setAccountId] = useState("")
+  const [account, setAccount] = useState<PickedAccount | null>(null)
   const [contactId, setContactId] = useState(NONE)
-  const [source, setSource] = useState(SIGNAL_SOURCES.intent_topic[0])
+  const [source, setSource] = useState<string | undefined>(undefined)
   const [title, setTitle] = useState("")
   const [detail, setDetail] = useState("")
   const [strength, setStrength] = useState(70)
 
-  const accountOptions = useMemo(
-    () => accounts.filter((a) => !a.duplicateOf).sort((a, b) => a.name.localeCompare(b.name)),
-    [accounts],
-  )
-  const contactOptions = useMemo(() => contacts.filter((c) => c.accountId === accountId), [contacts, accountId])
+  const contacts = useAccountContacts(account?.id)
+  const contactOptions = contacts.data ?? []
+  const sourceOptions = sources[type] ?? []
+  // Default to the first source for the selected type until the user picks one.
+  const effectiveSource = source && sourceOptions.includes(source) ? source : sourceOptions[0]
 
   const reset = () => {
     setType("intent_topic")
-    setAccountId("")
+    setAccount(null)
     setContactId(NONE)
-    setSource(SIGNAL_SOURCES.intent_topic[0])
+    setSource(undefined)
     setTitle("")
     setDetail("")
     setStrength(70)
   }
 
-  const valid = accountId && title.trim()
+  const valid = !!account && !!title.trim()
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!valid) return
-    const run = ingestSignal({
-      type,
-      accountId,
-      contactId: contactId === NONE ? undefined : contactId,
-      source,
-      title: title.trim(),
-      detail: detail.trim(),
-      strength,
-    })
-    showRun(run, "Signal ingested")
-    setOpen(false)
-    reset()
+    if (!account || !valid) return
+    ingest.mutate(
+      {
+        type,
+        accountId: account.id,
+        contactId: contactId === NONE ? undefined : contactId,
+        source: effectiveSource,
+        title: title.trim(),
+        detail: detail.trim() || undefined,
+        strength,
+      },
+      {
+        onSuccess: (r) => {
+          showRun(r.run, "Signal ingested", { accountName: account.name })
+          setOpen(false)
+          reset()
+        },
+      },
+    )
   }
 
   return (
@@ -156,9 +184,8 @@ function IngestSignalDialog() {
                 <Select
                   value={type}
                   onValueChange={(v) => {
-                    const t = v as SignalType
-                    setType(t)
-                    setSource(SIGNAL_SOURCES[t][0])
+                    setType(v as SignalType)
+                    setSource(undefined)
                   }}
                 >
                   <SelectTrigger className="w-full">
@@ -175,12 +202,12 @@ function IngestSignalDialog() {
               </Field>
               <Field>
                 <FieldLabel>Source</FieldLabel>
-                <Select value={source} onValueChange={setSource}>
+                <Select value={effectiveSource} onValueChange={setSource}>
                   <SelectTrigger className="w-full">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {SIGNAL_SOURCES[type].map((s) => (
+                    {sourceOptions.map((s) => (
                       <SelectItem key={s} value={s}>
                         {s}
                       </SelectItem>
@@ -192,30 +219,19 @@ function IngestSignalDialog() {
             <div className="grid gap-4 sm:grid-cols-2">
               <Field>
                 <FieldLabel>Account</FieldLabel>
-                <Select
-                  value={accountId}
-                  onValueChange={(v) => {
-                    setAccountId(v)
+                <AccountPicker
+                  value={account}
+                  onChange={(a) => {
+                    setAccount(a)
                     setContactId(NONE)
                   }}
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue placeholder="Select account" />
-                  </SelectTrigger>
-                  <SelectContent className="max-h-72">
-                    {accountOptions.map((a) => (
-                      <SelectItem key={a.id} value={a.id}>
-                        {a.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                />
               </Field>
               <Field>
                 <FieldLabel>Contact (optional)</FieldLabel>
-                <Select value={contactId} onValueChange={setContactId} disabled={!accountId}>
+                <Select value={contactId} onValueChange={setContactId} disabled={!account || contacts.isLoading}>
                   <SelectTrigger className="w-full">
-                    <SelectValue />
+                    <SelectValue placeholder={contacts.isLoading ? "Loading…" : undefined} />
                   </SelectTrigger>
                   <SelectContent className="max-h-72">
                     <SelectItem value={NONE}>No specific contact</SelectItem>
@@ -260,8 +276,8 @@ function IngestSignalDialog() {
             <Button type="button" variant="outline" onClick={() => setOpen(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!valid}>
-              <ZapIcon /> Ingest
+            <Button type="submit" disabled={!valid || ingest.isPending}>
+              {ingest.isPending ? <Loader2Icon className="animate-spin" /> : <ZapIcon />} Ingest
             </Button>
           </DialogFooter>
         </form>
@@ -275,22 +291,50 @@ function IngestSignalDialog() {
 // ---------------------------------------------------------------------------
 
 function SignalSheet({ signalId, onOpenChange }: { signalId: string | null; onOpenChange: (open: boolean) => void }) {
-  const signals = useStore((s) => s.signals)
-  const runs = useStore((s) => s.runs)
-  const rules = useStore((s) => s.rules)
-  const processSignal = useStore((s) => s.processSignal)
-  const lookup = useLookup()
+  const user = useCurrentUser()
+  const { data: signal, isLoading, error, refetch } = useSignal(signalId)
+  const playbooks = usePlaybooks()
+  const processSignal = useProcessSignal()
   const showRun = useRunToast()
 
-  const signal = useMemo(() => signals.find((s) => s.id === signalId), [signals, signalId])
-  const related = useMemo(() => runs.filter((r) => r.signalId === signalId), [runs, signalId])
-  const account = lookup.account(signal?.accountId)
-  const contact = lookup.contact(signal?.contactId)
+  const ruleName = (id?: string) => (id ? playbooks.data?.find((p) => p.id === id)?.name : undefined)
+  const account = signal?.account
+  const contact = signal?.contact
+  const related = signal?.runs ?? []
 
   return (
     <Sheet open={!!signalId} onOpenChange={onOpenChange}>
       <SheetContent className="w-full sm:max-w-xl">
-        {signal && (
+        {isLoading ? (
+          <>
+            <SheetHeader>
+              <SheetTitle className="sr-only">Loading signal</SheetTitle>
+              <div className="flex items-start gap-3 pr-8">
+                <Skeleton className="size-10 rounded-md" />
+                <div className="flex-1 space-y-2">
+                  <Skeleton className="h-5 w-2/3" />
+                  <Skeleton className="h-4 w-1/2" />
+                </div>
+              </div>
+            </SheetHeader>
+            <div className="space-y-3 px-4">
+              <Skeleton className="h-24 w-full" />
+              <Skeleton className="h-40 w-full" />
+            </div>
+          </>
+        ) : error || !signal ? (
+          <>
+            <SheetHeader>
+              <SheetTitle>Signal not found</SheetTitle>
+              <SheetDescription>This signal may have been deleted.</SheetDescription>
+            </SheetHeader>
+            {error && (
+              <div className="px-4">
+                <QueryError error={error} onRetry={() => refetch()} title="Couldn't load signal" />
+              </div>
+            )}
+          </>
+        ) : (
           <>
             <SheetHeader>
               <div className="flex items-start gap-3 pr-8">
@@ -354,9 +398,19 @@ function SignalSheet({ signalId, onOpenChange }: { signalId: string | null; onOp
                     ) : (
                       <>
                         <StatusBadge status="pending" />
-                        <Button size="xs" onClick={() => showRun(processSignal(signal.id), "Signal processed")}>
-                          <CpuIcon /> Process now
-                        </Button>
+                        {canWrite(user.role) && (
+                          <Button
+                            size="xs"
+                            disabled={processSignal.isPending}
+                            onClick={() =>
+                              processSignal.mutate(signal.id, {
+                                onSuccess: (run) => showRun(run, signal.title, { accountName: account?.name }),
+                              })
+                            }
+                          >
+                            {processSignal.isPending ? <Loader2Icon className="animate-spin" /> : <CpuIcon />} Process now
+                          </Button>
+                        )}
                       </>
                     )}
                   </dd>
@@ -371,7 +425,7 @@ function SignalSheet({ signalId, onOpenChange }: { signalId: string | null; onOp
                   </p>
                 ) : (
                   related.map((r) => (
-                    <RunSummary key={r.id} run={r} rule={rules.find((x) => x.id === r.ruleId)} />
+                    <RunSummary key={r.id} run={r} ruleName={ruleName(r.ruleId)} />
                   ))
                 )}
               </div>
@@ -397,12 +451,15 @@ export default function SignalsPage() {
 
 function SignalsPageInner() {
   const searchParams = useSearchParams()
-  const signals = useStore((s) => s.signals)
-  const autopilot = useStore((s) => s.autopilot)
-  const simulateSignal = useStore((s) => s.simulateSignal)
-  const processSignal = useStore((s) => s.processSignal)
-  const processPending = useStore((s) => s.processPending)
-  const lookup = useLookup()
+  const user = useCurrentUser()
+  const writable = canWrite(user.role)
+  const meta = useMeta()
+  const sources = useSignalSources()
+  const settings = useAgentSettings()
+  const statsQuery = useSignalStats()
+  const simulateSignal = useSimulateSignal()
+  const processSignal = useProcessSignal()
+  const processPending = useProcessPending()
   const showRun = useRunToast()
 
   const [query, setQuery] = useState("")
@@ -410,62 +467,45 @@ function SignalsPageInner() {
   const [source, setSource] = useState("all")
   const [state, setState] = useState<"all" | "pending" | "processed">("all")
   const [range, setRange] = useState<RangeKey>("30d")
-  const [page, setPage] = useState(0)
+  const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<string | null>(() => searchParams.get("signal"))
+  const debouncedQuery = useDebounced(query.trim(), 250)
 
-  // Capture "now" once per signals change so memoized filters stay pure.
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- recompute "now" whenever signals change
-  const now = useMemo(() => currentTime(), [signals])
+  const filters: SignalFilters = {
+    page,
+    pageSize: PAGE_SIZE,
+    q: debouncedQuery || undefined,
+    type: type === "all" ? undefined : [type],
+    source: source === "all" ? undefined : [source],
+    processed: state === "all" ? undefined : state === "processed",
+    sinceDays: RANGES[range].days,
+  }
+  const signalsQuery = useSignals(filters)
+  const rows = signalsQuery.data?.data ?? []
+  const total = signalsQuery.data?.meta.total ?? 0
 
-  const stats = useMemo(() => {
-    const within = (ms: number) => signals.filter((s) => now - new Date(s.occurredAt).getTime() <= ms)
-    const bySource = new Map<string, number>()
-    for (const s of signals) bySource.set(s.source, (bySource.get(s.source) ?? 0) + 1)
-    const sources = [...bySource.entries()].sort((a, b) => b[1] - a[1])
-    return {
-      day: within(DAY).length,
-      week: within(7 * DAY).length,
-      pending: signals.filter((s) => !s.processed).length,
-      sources,
-      total: signals.length,
-    }
-  }, [signals, now])
+  const stats = statsQuery.data
+  const statsLoading = !stats && statsQuery.isLoading
+  const autopilot = settings.data?.autopilot
+  const simulationEnabled = !!meta.data?.features.simulation
+  const pending = stats?.unprocessed ?? 0
+  const byType = SIGNAL_TYPES.map((t) => ({
+    type: SIGNAL_LABELS[t],
+    count: stats?.byType30d.find((x) => x.type === t)?.count ?? 0,
+  }))
+  const allSources = Array.from(
+    new Set([...Object.values(sources).flat(), ...(stats?.bySource.map((x) => x.source) ?? [])]),
+  ).sort()
 
-  const byType = useMemo(() => {
-    const recent = signals.filter((s) => now - new Date(s.occurredAt).getTime() <= 30 * DAY)
-    return SIGNAL_TYPES.map((t) => ({ type: SIGNAL_LABELS[t], count: recent.filter((s) => s.type === t).length }))
-  }, [signals, now])
-
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    const maxAge = RANGES[range].ms
-    return signals
-      .filter((s) => {
-        if (type !== "all" && s.type !== type) return false
-        if (source !== "all" && s.source !== source) return false
-        if (state === "pending" && s.processed) return false
-        if (state === "processed" && !s.processed) return false
-        if (now - new Date(s.occurredAt).getTime() > maxAge) return false
-        if (q) {
-          const acc = lookup.account(s.accountId)?.name ?? ""
-          const hay = `${s.title} ${s.detail} ${acc} ${s.source}`.toLowerCase()
-          if (!hay.includes(q)) return false
-        }
-        return true
-      })
-      .sort((a, b) => new Date(b.occurredAt).getTime() - new Date(a.occurredAt).getTime())
-  }, [signals, query, type, source, state, range, lookup, now])
-
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
-  const currentPage = Math.min(page, pageCount - 1)
-  const rows = filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const currentPage = Math.min(page, pageCount)
   const hasFilters = query || type !== "all" || source !== "all" || state !== "all" || range !== "30d"
 
   const withReset =
     <T,>(setter: (v: T) => void) =>
     (v: T) => {
       setter(v)
-      setPage(0)
+      setPage(1)
     }
 
   const clearFilters = () => {
@@ -474,17 +514,18 @@ function SignalsPageInner() {
     setSource("all")
     setState("all")
     setRange("30d")
-    setPage(0)
+    setPage(1)
   }
 
-  const simulate = () => showRun(simulateSignal(), "Simulated signal")
-
-  const processAll = () => {
-    const n = processPending()
-    toast.success(`Processed ${n} pending signal${n === 1 ? "" : "s"}`, {
-      description: "The agent re-scored accounts and ran matching playbooks.",
+  const simulate = () =>
+    simulateSignal.mutate(undefined, {
+      onSuccess: (r) => showRun(r.run, `Simulated: ${r.signal.title}`),
     })
-  }
+
+  const processRow = (s: SignalRecord) =>
+    processSignal.mutate(s.id, {
+      onSuccess: (run) => showRun(run, s.title, { accountName: s.account?.name }),
+    })
 
   return (
     <>
@@ -492,35 +533,54 @@ function SignalsPageInner() {
         title="Signals"
         description="Buying signals from intent, web, hiring, funding and social sources — the agent's trigger feed."
         actions={
-          <>
-            {stats.pending > 0 && (
-              <Button variant="outline" onClick={processAll}>
-                <CpuIcon /> Process {stats.pending} pending
-              </Button>
-            )}
-            <Button variant="outline" onClick={simulate}>
-              <ShuffleIcon /> Simulate
-            </Button>
-            <IngestSignalDialog />
-          </>
+          writable && (
+            <>
+              {pending > 0 && (
+                <Button variant="outline" onClick={() => processPending.mutate()} disabled={processPending.isPending}>
+                  {processPending.isPending ? <Loader2Icon className="animate-spin" /> : <CpuIcon />} Process {pending} pending
+                </Button>
+              )}
+              {simulationEnabled && (
+                <Button variant="outline" onClick={simulate} disabled={simulateSignal.isPending}>
+                  {simulateSignal.isPending ? <Loader2Icon className="animate-spin" /> : <ShuffleIcon />} Simulate
+                </Button>
+              )}
+              <IngestSignalDialog />
+            </>
+          )
         }
       />
 
+      {statsQuery.error && (
+        <QueryError error={statsQuery.error} onRetry={() => statsQuery.refetch()} title="Couldn't load signal stats" />
+      )}
+
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Signals (24h)" value={stats.day} icon={ActivityIcon} hint="ingested today" />
-        <StatCard label="Signals (7d)" value={stats.week} icon={RadioTowerIcon} hint={`${stats.total} all time`} />
-        <StatCard
-          label="Unprocessed"
-          value={stats.pending}
-          icon={ClockIcon}
-          hint={autopilot ? "Autopilot on" : "Autopilot off — signals queue up"}
-        />
-        <StatCard
-          label="Top source"
-          value={stats.sources[0]?.[0] ?? "—"}
-          icon={SparklesIcon}
-          hint={stats.sources[0] ? `${stats.sources[0][1]} signals` : undefined}
-        />
+        {statsLoading ? (
+          Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-28 rounded-xl" />)
+        ) : (
+          <>
+            <StatCard label="Signals (24h)" value={stats?.last24h ?? 0} icon={ActivityIcon} hint="ingested today" />
+            <StatCard
+              label="Signals (7d)"
+              value={stats?.last7d ?? 0}
+              icon={RadioTowerIcon}
+              hint={`${stats?.total ?? 0} all time`}
+            />
+            <StatCard
+              label="Unprocessed"
+              value={pending}
+              icon={ClockIcon}
+              hint={autopilot === undefined ? undefined : autopilot ? "Autopilot on" : "Autopilot off — signals queue up"}
+            />
+            <StatCard
+              label="Top source"
+              value={stats?.topSource ?? "—"}
+              icon={SparklesIcon}
+              hint={stats?.bySource[0] ? `${stats.bySource[0].count} signals` : undefined}
+            />
+          </>
+        )}
       </div>
 
       <div className="grid gap-4 lg:grid-cols-3">
@@ -530,15 +590,19 @@ function SignalsPageInner() {
             <CardDescription>Last 30 days</CardDescription>
           </CardHeader>
           <CardContent>
-            <ChartContainer config={typeChart} className="h-56 w-full">
-              <BarChart data={byType} layout="vertical" margin={{ left: 8, right: 16 }}>
-                <CartesianGrid horizontal={false} />
-                <XAxis type="number" hide allowDecimals={false} />
-                <YAxis dataKey="type" type="category" tickLine={false} axisLine={false} width={120} />
-                <ChartTooltip cursor={false} content={<ChartTooltipContent />} />
-                <Bar dataKey="count" fill="var(--color-count)" radius={4} />
-              </BarChart>
-            </ChartContainer>
+            {statsLoading ? (
+              <Skeleton className="h-56 w-full" />
+            ) : (
+              <ChartContainer config={typeChart} className="h-56 w-full">
+                <BarChart data={byType} layout="vertical" margin={{ left: 8, right: 16 }}>
+                  <CartesianGrid horizontal={false} />
+                  <XAxis type="number" hide allowDecimals={false} />
+                  <YAxis dataKey="type" type="category" tickLine={false} axisLine={false} width={120} />
+                  <ChartTooltip cursor={false} content={<ChartTooltipContent />} />
+                  <Bar dataKey="count" fill="var(--color-count)" radius={4} />
+                </BarChart>
+              </ChartContainer>
+            )}
           </CardContent>
         </Card>
         <Card>
@@ -547,8 +611,9 @@ function SignalsPageInner() {
             <CardDescription>Share of all ingested signals</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            {stats.sources.length === 0 && <p className="text-sm text-muted-foreground">No signals yet.</p>}
-            {stats.sources.map(([name, count]) => (
+            {statsLoading && Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-8 w-full" />)}
+            {stats && stats.bySource.length === 0 && <p className="text-sm text-muted-foreground">No signals yet.</p>}
+            {stats?.bySource.map(({ source: name, count }) => (
               <button
                 key={name}
                 type="button"
@@ -570,7 +635,8 @@ function SignalsPageInner() {
         <CardHeader>
           <CardTitle>Signal feed</CardTitle>
           <CardDescription>
-            {filtered.length} signal{filtered.length === 1 ? "" : "s"} · click a row for details and agent runs
+            {signalsQuery.data ? `${total} signal${total === 1 ? "" : "s"}` : "Loading signals"} · click a row for details and
+            agent runs
           </CardDescription>
           {hasFilters && (
             <CardAction>
@@ -611,7 +677,7 @@ function SignalsPageInner() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">All sources</SelectItem>
-                  {ALL_SOURCES.map((s) => (
+                  {allSources.map((s) => (
                     <SelectItem key={s} value={s}>
                       {s}
                     </SelectItem>
@@ -643,7 +709,11 @@ function SignalsPageInner() {
             </div>
           </div>
 
-          {filtered.length === 0 ? (
+          {signalsQuery.error ? (
+            <QueryError error={signalsQuery.error} onRetry={() => signalsQuery.refetch()} title="Couldn't load signals" />
+          ) : !signalsQuery.data ? (
+            <TableSkeleton rows={8} className="rounded-lg border" />
+          ) : rows.length === 0 ? (
             <EmptyState
               icon={RadioTowerIcon}
               title="No signals match"
@@ -653,16 +723,21 @@ function SignalsPageInner() {
                   <Button variant="outline" onClick={clearFilters}>
                     Clear filters
                   </Button>
-                ) : (
-                  <Button variant="outline" onClick={simulate}>
+                ) : writable && simulationEnabled ? (
+                  <Button variant="outline" onClick={simulate} disabled={simulateSignal.isPending}>
                     <ShuffleIcon /> Simulate a signal
                   </Button>
-                )
+                ) : undefined
               }
             />
           ) : (
             <>
-              <div className="overflow-hidden rounded-lg border">
+              <div
+                className={cn(
+                  "overflow-hidden rounded-lg border transition-opacity",
+                  signalsQuery.isPlaceholderData && "opacity-60",
+                )}
+              >
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -681,7 +756,8 @@ function SignalsPageInner() {
                         key={s.id}
                         signal={s}
                         onOpen={() => setSelected(s.id)}
-                        onProcess={() => showRun(processSignal(s.id), "Signal processed")}
+                        onProcess={writable ? () => processRow(s) : undefined}
+                        processing={processSignal.isPending && processSignal.variables === s.id}
                       />
                     ))}
                   </TableBody>
@@ -689,17 +765,16 @@ function SignalsPageInner() {
               </div>
               <div className="flex items-center justify-between gap-2 text-sm text-muted-foreground">
                 <span>
-                  Showing {currentPage * PAGE_SIZE + 1}–{Math.min(filtered.length, (currentPage + 1) * PAGE_SIZE)} of{" "}
-                  {filtered.length}
+                  Showing {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(total, currentPage * PAGE_SIZE)} of {total}
                 </span>
                 <div className="flex items-center gap-2">
                   <span className="tabular-nums">
-                    Page {currentPage + 1} / {pageCount}
+                    Page {currentPage} / {pageCount}
                   </span>
                   <Button
                     variant="outline"
                     size="icon-sm"
-                    disabled={currentPage === 0}
+                    disabled={currentPage <= 1}
                     onClick={() => setPage(currentPage - 1)}
                     aria-label="Previous page"
                   >
@@ -708,7 +783,7 @@ function SignalsPageInner() {
                   <Button
                     variant="outline"
                     size="icon-sm"
-                    disabled={currentPage >= pageCount - 1}
+                    disabled={currentPage >= pageCount}
                     onClick={() => setPage(currentPage + 1)}
                     aria-label="Next page"
                   >
@@ -726,10 +801,18 @@ function SignalsPageInner() {
   )
 }
 
-function SignalRow({ signal: s, onOpen, onProcess }: { signal: Signal; onOpen: () => void; onProcess: () => void }) {
-  const lookup = useLookup()
-  const account = lookup.account(s.accountId)
-  const contact = lookup.contact(s.contactId)
+function SignalRow({
+  signal: s,
+  onOpen,
+  onProcess,
+  processing,
+}: {
+  signal: SignalRecord
+  onOpen: () => void
+  onProcess?: () => void
+  processing?: boolean
+}) {
+  const { account, contact } = s
   return (
     <TableRow className="cursor-pointer" onClick={onOpen}>
       <TableCell className="max-w-96">
@@ -775,16 +858,20 @@ function SignalRow({ signal: s, onOpen, onProcess }: { signal: Signal; onOpen: (
         ) : (
           <div className="flex items-center justify-end gap-2">
             <StatusBadge status="pending" />
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={(e) => {
-                e.stopPropagation()
-                onProcess()
-              }}
-            >
-              Process
-            </Button>
+            {onProcess && (
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={processing}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onProcess()
+                }}
+              >
+                {processing && <Loader2Icon className="animate-spin" />}
+                Process
+              </Button>
+            )}
           </div>
         )}
       </TableCell>

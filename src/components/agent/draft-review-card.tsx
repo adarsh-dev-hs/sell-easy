@@ -13,49 +13,63 @@ import { Textarea } from "@/components/ui/textarea"
 import { CompanyAvatar } from "@/components/shared/avatars"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
 import { TierBadge } from "@/components/shared/score"
+import { canWrite, type DraftRecord, useApproveDraft, useCurrentUser, useRegenerateDraft, useRejectDraft } from "@/lib/api"
 import { fullName, timeAgo } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
-import type { OutreachDraft } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
-export function DraftReviewCard({ draft, className, compact }: { draft: OutreachDraft; className?: string; compact?: boolean }) {
-  const lookup = useLookup()
-  const approveDraft = useStore((s) => s.approveDraft)
-  const rejectDraft = useStore((s) => s.rejectDraft)
-  const regenerateDraft = useStore((s) => s.regenerateDraft)
+interface DraftReviewCardProps {
+  draft: DraftRecord
+  className?: string
+  compact?: boolean
+}
+
+/** Review card for a pending draft. Local edits reset whenever the server copy changes (e.g. after regenerate). */
+export function DraftReviewCard(props: DraftReviewCardProps) {
+  return <DraftReviewCardInner key={`${props.draft.id}:${props.draft.updatedAt}`} {...props} />
+}
+
+function DraftReviewCardInner({ draft, className, compact }: DraftReviewCardProps) {
+  const user = useCurrentUser()
+  const writable = canWrite(user.role)
+  const approveDraft = useApproveDraft()
+  const rejectDraft = useRejectDraft()
+  const regenerateDraft = useRegenerateDraft()
   const [subject, setSubject] = useState(draft.subject)
   const [body, setBody] = useState(draft.body)
-  const [regenerating, setRegenerating] = useState(false)
 
-  const account = lookup.account(draft.accountId)
-  const contact = lookup.contact(draft.contactId)
-  const sequence = lookup.sequence(draft.sequenceId)
+  const { account, contact } = draft
   const edited = subject !== draft.subject || body !== draft.body
+  const regenerating = regenerateDraft.isPending
+  const busy = regenerating || approveDraft.isPending || rejectDraft.isPending
 
-  const regenerate = async () => {
-    setRegenerating(true)
-    try {
-      await regenerateDraft(draft.id)
-      const fresh = useStore.getState().drafts.find((d) => d.id === draft.id)
-      if (fresh) {
+  const regenerate = () =>
+    regenerateDraft.mutate(draft.id, {
+      // The mutation invalidates the drafts query; the refreshed draft (new updatedAt) remounts this card.
+      onSuccess: (fresh) => {
         setSubject(fresh.subject)
         setBody(fresh.body)
-      }
-      toast.success("Draft regenerated", { description: "Claude wrote a new variant." })
-    } finally {
-      setRegenerating(false)
-    }
-  }
+      },
+    })
 
   const approve = () => {
     if (!subject.trim() || !body.trim()) {
       toast.error("Subject and body are required")
       return
     }
-    approveDraft(draft.id, edited ? { subject, body } : undefined)
-    toast.success(`Sent to ${contact ? fullName(contact) : "contact"}`, {
-      description: sequence ? `Enrolled in “${sequence.name}”` : edited ? "Sent with your edits" : undefined,
-    })
+    approveDraft.mutate(
+      { id: draft.id, ...(edited ? { subject, body } : {}) },
+      {
+        onSuccess: (r) => {
+          toast.success(`Sent to ${r.contact?.name ?? (contact ? fullName(contact) : "contact")}`, {
+            description: r.enrollment
+              ? `Enrolled in “${r.enrollment.sequence.name}”`
+              : edited
+                ? "Sent with your edits"
+                : undefined,
+          })
+        },
+      },
+    )
   }
 
   return (
@@ -97,7 +111,13 @@ export function DraftReviewCard({ draft, className, compact }: { draft: Outreach
         <FieldGroup className="gap-3">
           <Field>
             <FieldLabel htmlFor={`subj-${draft.id}`}>Subject</FieldLabel>
-            <Input id={`subj-${draft.id}`} value={subject} onChange={(e) => setSubject(e.target.value)} disabled={regenerating} />
+            <Input
+              id={`subj-${draft.id}`}
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              disabled={busy}
+              readOnly={!writable}
+            />
           </Field>
           <Field>
             <FieldLabel htmlFor={`body-${draft.id}`}>Message</FieldLabel>
@@ -107,34 +127,34 @@ export function DraftReviewCard({ draft, className, compact }: { draft: Outreach
               className={cn("field-sizing-fixed resize-y", compact ? "min-h-36" : "min-h-48")}
               value={body}
               onChange={(e) => setBody(e.target.value)}
-              disabled={regenerating}
+              disabled={busy}
+              readOnly={!writable}
             />
           </Field>
         </FieldGroup>
       </CardContent>
-      <CardFooter className="flex flex-wrap justify-end gap-2">
-        <ConfirmDialog
-          title="Reject this draft?"
-          description="The draft will be discarded and the agent run marked complete without sending."
-          confirmLabel="Reject"
-          onConfirm={() => {
-            rejectDraft(draft.id)
-            toast("Draft rejected")
-          }}
-          trigger={
-            <Button variant="ghost" disabled={regenerating}>
-              <XIcon /> Reject
-            </Button>
-          }
-        />
-        <Button variant="outline" onClick={regenerate} disabled={regenerating}>
-          {regenerating ? <Loader2Icon className="animate-spin" /> : <RefreshCwIcon />}
-          Regenerate
-        </Button>
-        <Button onClick={approve} disabled={regenerating}>
-          <CheckIcon /> Approve & send
-        </Button>
-      </CardFooter>
+      {writable && (
+        <CardFooter className="flex flex-wrap justify-end gap-2">
+          <ConfirmDialog
+            title="Reject this draft?"
+            description="The draft will be discarded and the agent run marked complete without sending."
+            confirmLabel="Reject"
+            onConfirm={() => rejectDraft.mutate(draft.id)}
+            trigger={
+              <Button variant="ghost" disabled={busy}>
+                {rejectDraft.isPending ? <Loader2Icon className="animate-spin" /> : <XIcon />} Reject
+              </Button>
+            }
+          />
+          <Button variant="outline" onClick={regenerate} disabled={busy}>
+            {regenerating ? <Loader2Icon className="animate-spin" /> : <RefreshCwIcon />}
+            Regenerate
+          </Button>
+          <Button onClick={approve} disabled={busy}>
+            {approveDraft.isPending ? <Loader2Icon className="animate-spin" /> : <CheckIcon />} Approve & send
+          </Button>
+        </CardFooter>
+      )}
     </Card>
   )
 }

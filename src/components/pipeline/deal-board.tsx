@@ -27,15 +27,17 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { Skeleton } from "@/components/ui/skeleton"
 import { CompanyAvatar, UserAvatar } from "@/components/shared/avatars"
+import { type DealRecord, useMoveDeal } from "@/lib/api"
 import { DEAL_STAGE_LABEL, DEAL_STAGES } from "@/lib/constants"
 import { currency, shortDate, timeAgo } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
-import type { Deal, DealStage } from "@/lib/types"
+import type { DealStage, User } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { isAgentSourced, isOverdue } from "./deal-utils"
+import { useCrmName, useTeam } from "./hooks"
 
-type Lookup = ReturnType<typeof useLookup>
+type CardCtx = { nowMs: number; usersById: Map<string, User>; crmName: string }
 
 const STAGE_ACCENT: Record<DealStage, string> = {
   discovery: "bg-slate-400",
@@ -51,13 +53,17 @@ export function DealBoard({
   deals,
   nowMs,
   onOpen,
+  canEdit,
 }: {
-  deals: Deal[]
+  deals: DealRecord[]
   nowMs: number
   onOpen: (id: string) => void
+  canEdit: boolean
 }) {
-  const moveDeal = useStore((s) => s.moveDeal)
-  const lookup = useLookup()
+  const moveDeal = useMoveDeal()
+  const { byId } = useTeam()
+  const crmName = useCrmName()
+  const ctx: CardCtx = { nowMs, usersById: byId, crmName }
   const [activeId, setActiveId] = useState<string | null>(null)
   const lastDragEnd = useRef(0)
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }))
@@ -66,23 +72,33 @@ export function DealBoard({
     () =>
       DEAL_STAGES.map((stage) => {
         const items = deals.filter((d) => d.stage === stage.id)
-        return { ...stage, items, total: items.reduce((s, d) => s + d.amount, 0) }
+        return {
+          ...stage,
+          items,
+          total: items.reduce((s, d) => s + d.amount, 0),
+        }
       }),
     [deals],
   )
   const activeDeal = activeId ? deals.find((d) => d.id === activeId) : undefined
 
-  const move = (deal: Deal, stage: DealStage) => {
-    if (deal.stage === stage) return
-    moveDeal(deal.id, stage)
-    toast.success(`${deal.name} moved to ${DEAL_STAGE_LABEL[stage]}`)
+  const move = (deal: DealRecord, stage: DealStage) => {
+    if (!canEdit || deal.stage === stage) return
+    moveDeal.mutate(
+      { id: deal.id, stage },
+      {
+        onSuccess: () => toast.success(`${deal.name} moved to ${DEAL_STAGE_LABEL[stage]}`),
+      },
+    )
   }
 
-  const handleDragStart = (e: DragStartEvent) => setActiveId(String(e.active.id))
+  const handleDragStart = (e: DragStartEvent) => {
+    if (canEdit) setActiveId(String(e.active.id))
+  }
   const handleDragEnd = (e: DragEndEvent) => {
     setActiveId(null)
     lastDragEnd.current = Date.now()
-    if (!e.over) return
+    if (!canEdit || !e.over) return
     const deal = deals.find((d) => d.id === e.active.id)
     if (deal) move(deal, e.over.id as DealStage)
   }
@@ -94,27 +110,20 @@ export function DealBoard({
   }
 
   return (
-    <DndContext
-      sensors={sensors}
-      onDragStart={handleDragStart}
-      onDragEnd={handleDragEnd}
-      onDragCancel={() => setActiveId(null)}
-    >
+    <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragCancel={() => setActiveId(null)}>
       <div className="-mx-4 overflow-x-auto px-4 pb-2 md:-mx-6 md:px-6">
         <div className="flex min-w-max gap-3">
           {columns.map((col) => (
-            <BoardColumn key={col.id} id={col.id} label={col.label} count={col.items.length} total={col.total}>
+            <BoardColumn key={col.id} id={col.id} label={col.label} count={col.items.length} total={col.total} emptyLabel={canEdit ? "Drop deals here" : "No deals"}>
               {col.items.map((d) => (
-                <DraggableDeal key={d.id} deal={d} nowMs={nowMs} lookup={lookup} onOpen={open} onMove={move} />
+                <DraggableDeal key={d.id} deal={d} ctx={ctx} canEdit={canEdit} onOpen={open} onMove={move} />
               ))}
             </BoardColumn>
           ))}
         </div>
       </div>
       <DragOverlay dropAnimation={null}>
-        {activeDeal ? (
-          <DealCardBody deal={activeDeal} nowMs={nowMs} lookup={lookup} className="rotate-2 shadow-lg ring-2 ring-primary/40" />
-        ) : null}
+        {activeDeal ? <DealCardBody deal={activeDeal} ctx={ctx} className="rotate-2 shadow-lg ring-2 ring-primary/40" /> : null}
       </DragOverlay>
     </DndContext>
   )
@@ -125,12 +134,14 @@ function BoardColumn({
   label,
   count,
   total,
+  emptyLabel,
   children,
 }: {
   id: DealStage
   label: string
   count: number
   total: number
+  emptyLabel: string
   children: React.ReactNode
 }) {
   const { setNodeRef, isOver } = useDroppable({ id })
@@ -154,7 +165,7 @@ function BoardColumn({
         {children}
         {count === 0 && (
           <div className="flex flex-1 items-center justify-center rounded-lg border border-dashed p-6 text-xs text-muted-foreground">
-            Drop deals here
+            {emptyLabel}
           </div>
         )}
       </div>
@@ -164,18 +175,21 @@ function BoardColumn({
 
 function DraggableDeal({
   deal,
-  nowMs,
-  lookup,
+  ctx,
+  canEdit,
   onOpen,
   onMove,
 }: {
-  deal: Deal
-  nowMs: number
-  lookup: Lookup
+  deal: DealRecord
+  ctx: CardCtx
+  canEdit: boolean
   onOpen: (id: string) => void
-  onMove: (deal: Deal, stage: DealStage) => void
+  onMove: (deal: DealRecord, stage: DealStage) => void
 }) {
-  const { setNodeRef, attributes, listeners, isDragging } = useDraggable({ id: deal.id })
+  const { setNodeRef, attributes, listeners, isDragging } = useDraggable({
+    id: deal.id,
+    disabled: !canEdit,
+  })
   return (
     <div
       ref={setNodeRef}
@@ -190,47 +204,49 @@ function DraggableDeal({
         }
       }}
       className={cn(
-        "cursor-grab rounded-lg outline-none focus-visible:ring-3 focus-visible:ring-ring/50 active:cursor-grabbing",
+        "rounded-lg outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+        canEdit ? "cursor-grab active:cursor-grabbing" : "cursor-pointer",
         isDragging && "opacity-40",
       )}
     >
       <DealCardBody
         deal={deal}
-        nowMs={nowMs}
-        lookup={lookup}
+        ctx={ctx}
         menu={
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Deal actions"
-                onPointerDown={(e) => e.stopPropagation()}
+          canEdit && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Deal actions"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => e.stopPropagation()}
+                >
+                  <MoreHorizontalIcon />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                className="w-48"
                 onClick={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
                 onKeyDown={(e) => e.stopPropagation()}
               >
-                <MoreHorizontalIcon />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="end"
-              className="w-48"
-              onClick={(e) => e.stopPropagation()}
-              onPointerDown={(e) => e.stopPropagation()}
-              onKeyDown={(e) => e.stopPropagation()}
-            >
-              <DropdownMenuItem onSelect={() => onOpen(deal.id)}>Open deal</DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuLabel className="text-xs text-muted-foreground">Move to stage</DropdownMenuLabel>
-              <DropdownMenuRadioGroup value={deal.stage} onValueChange={(v) => onMove(deal, v as DealStage)}>
-                {DEAL_STAGES.map((s) => (
-                  <DropdownMenuRadioItem key={s.id} value={s.id}>
-                    {s.label}
-                  </DropdownMenuRadioItem>
-                ))}
-              </DropdownMenuRadioGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
+                <DropdownMenuItem onSelect={() => onOpen(deal.id)}>Open deal</DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="text-xs text-muted-foreground">Move to stage</DropdownMenuLabel>
+                <DropdownMenuRadioGroup value={deal.stage} onValueChange={(v) => onMove(deal, v as DealStage)}>
+                  {DEAL_STAGES.map((s) => (
+                    <DropdownMenuRadioItem key={s.id} value={s.id}>
+                      {s.label}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )
         }
       />
     </div>
@@ -239,22 +255,25 @@ function DraggableDeal({
 
 function DealCardBody({
   deal,
-  nowMs,
-  lookup,
+  ctx,
   menu,
   className,
 }: {
-  deal: Deal
-  nowMs: number
-  lookup: Lookup
+  deal: DealRecord
+  ctx: CardCtx
   menu?: React.ReactNode
   className?: string
 }) {
-  const account = lookup.account(deal.accountId)
-  const owner = lookup.user(deal.ownerId)
-  const overdue = isOverdue(deal, nowMs)
+  const { account } = deal
+  const owner = ctx.usersById.get(deal.ownerId)
+  const overdue = isOverdue(deal, ctx.nowMs)
   return (
-    <div className={cn("space-y-2.5 rounded-lg border bg-card p-3 text-card-foreground shadow-xs hover:border-foreground/20", className)}>
+    <div
+      className={cn(
+        "space-y-2.5 rounded-lg border bg-card p-3 text-card-foreground shadow-xs hover:border-foreground/20",
+        className,
+      )}
+    >
       <div className="flex items-start gap-2">
         <div className="min-w-0 flex-1 text-sm leading-snug font-medium">{deal.name}</div>
         {menu}
@@ -294,7 +313,7 @@ function DealCardBody({
               </span>
             </TooltipTrigger>
             <TooltipContent>
-              {deal.syncedAt ? `Synced to HubSpot ${timeAgo(deal.syncedAt)}` : "Changes not yet pushed to CRM"}
+              {deal.syncedAt ? `Synced to ${ctx.crmName} ${timeAgo(deal.syncedAt)}` : "Changes not yet pushed to CRM"}
             </TooltipContent>
           </Tooltip>
           <Tooltip>
@@ -306,6 +325,28 @@ function DealCardBody({
             <TooltipContent>{owner?.name ?? "Unassigned"}</TooltipContent>
           </Tooltip>
         </div>
+      </div>
+    </div>
+  )
+}
+
+export function DealBoardSkeleton() {
+  return (
+    <div className="-mx-4 overflow-x-auto px-4 pb-2 md:-mx-6 md:px-6">
+      <div className="flex min-w-max gap-3">
+        {DEAL_STAGES.map((stage) => (
+          <div key={stage.id} className="flex w-72 shrink-0 flex-col rounded-xl border bg-muted/40">
+            <div className="flex items-center gap-2 border-b px-3 py-2.5">
+              <span className={cn("size-2 rounded-full", STAGE_ACCENT[stage.id])} />
+              <span className="text-sm font-medium">{stage.label}</span>
+            </div>
+            <div className="flex min-h-40 flex-col gap-2 p-2">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <Skeleton key={i} className="h-28 w-full rounded-lg" />
+              ))}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   )

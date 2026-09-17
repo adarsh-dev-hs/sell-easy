@@ -9,7 +9,7 @@ import { InboxTab } from "@/components/outreach/inbox-tab"
 import { MailboxesTab } from "@/components/outreach/mailboxes-tab"
 import { SequencesTab } from "@/components/outreach/sequences-tab"
 import { PageHeader } from "@/components/shared/page-header"
-import { useStore } from "@/lib/store"
+import { useInboxCounts } from "@/lib/api"
 
 const TABS = ["sequences", "inbox", "mailboxes"] as const
 type Tab = (typeof TABS)[number]
@@ -20,7 +20,7 @@ function OutreachInner() {
   const params = useSearchParams()
   const raw = params.get("tab")
   const tab: Tab = (TABS as readonly string[]).includes(raw ?? "") ? (raw as Tab) : "sequences"
-  const unread = useStore((s) => s.inbox.reduce((n, m) => n + (!m.read && !m.archived ? 1 : 0), 0))
+  const unread = useInboxCounts(false).data?.unread ?? 0
 
   const setTab = (value: string) => {
     const next = new URLSearchParams(params.toString())

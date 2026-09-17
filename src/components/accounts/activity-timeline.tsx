@@ -15,7 +15,7 @@ import {
 import { AgentAvatar, UserAvatar } from "@/components/shared/avatars"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { dateTime, timeAgo } from "@/lib/format"
-import { useLookup } from "@/lib/store"
+import { useUsers } from "@/lib/api"
 import type { Activity } from "@/lib/types"
 
 const TYPE_ICONS: Record<Activity["type"], LucideIcon> = {
@@ -31,7 +31,7 @@ const TYPE_ICONS: Record<Activity["type"], LucideIcon> = {
 }
 
 export function ActorLabel({ actorId }: { actorId?: Activity["actorId"] }) {
-  const lookup = useLookup()
+  const { data: users } = useUsers()
   if (actorId === "agent")
     return (
       <span className="inline-flex items-center gap-1.5">
@@ -39,7 +39,7 @@ export function ActorLabel({ actorId }: { actorId?: Activity["actorId"] }) {
         <span>Agent</span>
       </span>
     )
-  const user = actorId && actorId !== "system" ? lookup.user(actorId) : undefined
+  const user = actorId && actorId !== "system" ? users?.find((u) => u.id === actorId) : undefined
   if (!user)
     return (
       <span className="inline-flex items-center gap-1.5">
@@ -57,6 +57,7 @@ export function ActorLabel({ actorId }: { actorId?: Activity["actorId"] }) {
   )
 }
 
+/** Renders a list of activities (fetched by the caller). Actor names are resolved from the team list. */
 export function ActivityTimeline({ items, emptyText = "No activity yet." }: { items: Activity[]; emptyText?: string }) {
   if (items.length === 0) return <p className="py-6 text-center text-sm text-muted-foreground">{emptyText}</p>
   return (

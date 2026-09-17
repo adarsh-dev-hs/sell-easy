@@ -1,21 +1,25 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import { addDays } from "date-fns"
+import { Loader2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { type AccountRecord, useAccountContacts, useCreateDeal, useCurrentUser } from "@/lib/api"
 import { DEAL_STAGES } from "@/lib/constants"
 import { fullName } from "@/lib/format"
-import { useStore } from "@/lib/store"
 import type { DealStage } from "@/lib/types"
 import { AccountCombobox } from "./account-combobox"
 import { fromDateInput, toDateInput } from "./deal-utils"
+import { useTeam } from "./hooks"
 
 const NONE = "__none"
+/** Until the user picks a contact, default to the account's first contact once it loads. */
+const AUTO = "__auto"
 const autoName = (account?: string) => (account ? `${account} – New deal` : "")
 
 export function NewDealDialog({
@@ -37,40 +41,35 @@ export function NewDealDialog({
 }
 
 function NewDealForm({ onDone, onCreated }: { onDone: () => void; onCreated?: (id: string) => void }) {
-  const accounts = useStore((s) => s.accounts)
-  const contacts = useStore((s) => s.contacts)
-  const users = useStore((s) => s.users)
-  const currentUserId = useStore((s) => s.currentUserId)
-  const addDeal = useStore((s) => s.addDeal)
+  const user = useCurrentUser()
+  const { sellers } = useTeam()
+  const createDeal = useCreateDeal()
 
-  const [form, setForm] = useState({
+  const [form, setForm] = useState(() => ({
     accountId: "",
+    accountName: "",
     name: "",
     amount: "25000",
     stage: "discovery" as DealStage,
     closeDate: toDateInput(addDays(new Date(), 30).toISOString()),
-    ownerId: currentUserId,
-    contactId: NONE,
-  })
+    ownerId: user.id,
+    contactId: AUTO,
+  }))
   const set = <K extends keyof typeof form>(k: K, v: (typeof form)[K]) => setForm((f) => ({ ...f, [k]: v }))
 
-  const sellers = useMemo(() => users.filter((u) => u.role !== "viewer"), [users])
-  const accountContacts = useMemo(
-    () => (form.accountId ? contacts.filter((c) => c.accountId === form.accountId) : []),
-    [contacts, form.accountId],
-  )
+  const { data: accountContacts = [] } = useAccountContacts(form.accountId || undefined)
+  const contactId = form.contactId === AUTO ? (accountContacts[0]?.id ?? NONE) : form.contactId
 
-  const selectAccount = (accountId: string) => {
-    const account = accounts.find((a) => a.id === accountId)
+  const selectAccount = (accountId: string, account?: AccountRecord) => {
     setForm((f) => {
-      const prev = accounts.find((a) => a.id === f.accountId)
-      const keepName = f.name.trim() && f.name !== autoName(prev?.name)
+      const keepName = f.name.trim() && f.name !== autoName(f.accountName)
       return {
         ...f,
         accountId,
+        accountName: account?.name ?? "",
         name: keepName ? f.name : autoName(account?.name),
         ownerId: account?.ownerId && sellers.some((u) => u.id === account.ownerId) ? account.ownerId : f.ownerId,
-        contactId: contacts.find((c) => c.accountId === accountId)?.id ?? NONE,
+        contactId: AUTO,
       }
     })
   }
@@ -82,21 +81,28 @@ function NewDealForm({ onDone, onCreated }: { onDone: () => void; onCreated?: (i
     if (!form.name.trim()) return toast.error("Deal name is required")
     if (!Number.isFinite(amount) || amount <= 0) return toast.error("Enter a valid amount")
     if (!form.closeDate) return toast.error("Close date is required")
-    const id = addDeal({
-      name: form.name.trim(),
-      accountId: form.accountId,
-      amount,
-      stage: form.stage,
-      closeDate: fromDateInput(form.closeDate),
-      ownerId: form.ownerId,
-      contactId: form.contactId === NONE ? undefined : form.contactId,
-      source: "Manual",
-    })
-    toast.success("Deal created", {
-      description: form.name.trim(),
-      action: onCreated ? { label: "Open", onClick: () => onCreated(id) } : undefined,
-    })
-    onDone()
+    const name = form.name.trim()
+    createDeal.mutate(
+      {
+        name,
+        accountId: form.accountId,
+        amount,
+        stage: form.stage,
+        closeDate: fromDateInput(form.closeDate),
+        ownerId: form.ownerId,
+        contactId: contactId === NONE ? undefined : contactId,
+        source: "Manual",
+      },
+      {
+        onSuccess: (deal) => {
+          toast.success("Deal created", {
+            description: name,
+            action: onCreated ? { label: "Open", onClick: () => onCreated(deal.id) } : undefined,
+          })
+          onDone()
+        },
+      },
+    )
   }
 
   return (
@@ -117,7 +123,14 @@ function NewDealForm({ onDone, onCreated }: { onDone: () => void; onCreated?: (i
         <div className="grid gap-4 sm:grid-cols-2">
           <Field>
             <FieldLabel htmlFor="nd-amount">Amount (USD)</FieldLabel>
-            <Input id="nd-amount" type="number" min={0} step={1000} value={form.amount} onChange={(e) => set("amount", e.target.value)} />
+            <Input
+              id="nd-amount"
+              type="number"
+              min={0}
+              step={1000}
+              value={form.amount}
+              onChange={(e) => set("amount", e.target.value)}
+            />
           </Field>
           <Field>
             <FieldLabel htmlFor="nd-stage">Stage</FieldLabel>
@@ -156,7 +169,7 @@ function NewDealForm({ onDone, onCreated }: { onDone: () => void; onCreated?: (i
         </div>
         <Field>
           <FieldLabel htmlFor="nd-contact">Primary contact</FieldLabel>
-          <Select value={form.contactId} onValueChange={(v) => set("contactId", v)} disabled={!form.accountId}>
+          <Select value={contactId} onValueChange={(v) => set("contactId", v)} disabled={!form.accountId}>
             <SelectTrigger id="nd-contact" className="w-full">
               <SelectValue placeholder={form.accountId ? "Select contact" : "Select an account first"} />
             </SelectTrigger>
@@ -175,7 +188,10 @@ function NewDealForm({ onDone, onCreated }: { onDone: () => void; onCreated?: (i
         <Button type="button" variant="outline" onClick={onDone}>
           Cancel
         </Button>
-        <Button type="submit">Create deal</Button>
+        <Button type="submit" disabled={createDeal.isPending}>
+          {createDeal.isPending && <Loader2Icon className="animate-spin" />}
+          Create deal
+        </Button>
       </DialogFooter>
     </form>
   )

@@ -1,9 +1,9 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import Link from "next/link"
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts"
-import { AlertCircleIcon, CheckIcon, RotateCcwIcon, SaveIcon, SigmaIcon, Undo2Icon } from "lucide-react"
+import { AlertCircleIcon, CheckIcon, Loader2Icon, RotateCcwIcon, SaveIcon, SigmaIcon, Undo2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -13,30 +13,66 @@ import { type ChartConfig, ChartContainer, ChartLegend, ChartLegendContent, Char
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Slider } from "@/components/ui/slider"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { useDebounced } from "@/components/signals/use-debounced"
 import { CompanyAvatar } from "@/components/shared/avatars"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
 import { PageHeader } from "@/components/shared/page-header"
+import { QueryError } from "@/components/shared/query-state"
 import { ScoreBar, TierBadge } from "@/components/shared/score"
 import { SignalIcon } from "@/components/shared/status"
+import {
+  ApiError,
+  type IcpInput,
+  isAdmin,
+  toIcpInput,
+  useCurrentUser,
+  useIcp,
+  useIcpDefaults,
+  useIcpPreview,
+  useMeta,
+  useSaveIcp,
+} from "@/lib/api"
 import { COUNTRIES, FUNDING_STAGES, INDUSTRIES, SIGNAL_LABELS, TECHNOLOGIES } from "@/lib/constants"
 import { timeAgo } from "@/lib/format"
-import { defaultIcp } from "@/lib/mock-data"
-import { scoreAccount } from "@/lib/scoring"
-import { useStore } from "@/lib/store"
-import type { IcpConfig, SignalType, Tier } from "@/lib/types"
+import type { IcpConfig, SignalType } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 const SIGNAL_TYPES = Object.keys(SIGNAL_LABELS) as SignalType[]
-const TIERS: Tier[] = ["A", "B", "C", "D"]
 
 const tierChart = {
   current: { label: "Current", color: "var(--chart-2)" },
   draft: { label: "Draft", color: "var(--chart-1)" },
 } satisfies ChartConfig
 
-const comparable = (c: IcpConfig) => JSON.stringify({ ...c, updatedAt: undefined })
+/** Order-insensitive serialization so drafts compare equal regardless of key order. */
+function comparable(c: IcpInput) {
+  const sortKeys = (v: unknown): unknown =>
+    v && typeof v === "object" && !Array.isArray(v)
+      ? Object.fromEntries(
+          Object.entries(v)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([k, x]) => [k, sortKeys(x)]),
+        )
+      : v
+  return JSON.stringify(sortKeys(c))
+}
+
+/** Client-side checks mirrored from the API so the user gets immediate feedback. */
+function validate(draft: IcpInput) {
+  const e: string[] = []
+  const t = draft.tierThresholds
+  if (!(t.A > t.B && t.B > t.C)) e.push("Tier thresholds must be strictly descending (A > B > C).")
+  if (t.C <= 0) e.push("Tier C threshold must be greater than 0.")
+  if (draft.employeeMin < 0 || draft.employeeMax < 0) e.push("Employee counts can't be negative.")
+  if (draft.employeeMin > draft.employeeMax) e.push("Minimum employees must be ≤ maximum employees.")
+  if (draft.revenueMin < 0) e.push("Minimum revenue can't be negative.")
+  if (draft.industries.length === 0) e.push("Select at least one industry.")
+  if (draft.intentDecayDays < 1) e.push("Intent half-life must be at least 1 day.")
+  return e
+}
 
 function ChipSelect({
   options,
@@ -131,65 +167,88 @@ function SliderField({
 }
 
 export default function ScoringPage() {
-  const icp = useStore((s) => s.icp)
-  const accounts = useStore((s) => s.accounts)
-  const signals = useStore((s) => s.signals)
-  const updateIcp = useStore((s) => s.updateIcp)
+  const { data: icp, error, refetch } = useIcp()
 
-  const [draft, setDraft] = useState<IcpConfig>(icp)
-  const patch = (p: Partial<IcpConfig>) => setDraft((d) => ({ ...d, ...p }))
+  if (error) {
+    return (
+      <>
+        <PageHeader title="ICP & Scoring" description="Define your ideal customer profile and how fit and intent combine into a score." />
+        <QueryError error={error} onRetry={() => refetch()} title="Couldn't load the ICP" />
+      </>
+    )
+  }
+  if (!icp) return <ScoringSkeleton />
+  // Re-key on every server change so the draft re-initializes from the saved config (e.g. after Save).
+  return <IcpEditor key={icp.updatedAt} icp={icp} />
+}
 
-  const dirty = comparable(draft) !== comparable(icp)
-  const isDefault = comparable(draft) === comparable(defaultIcp(draft.updatedAt))
+function ScoringSkeleton() {
+  return (
+    <>
+      <PageHeader title="ICP & Scoring" description="Define your ideal customer profile and how fit and intent combine into a score." />
+      <div className="grid items-start gap-4 lg:grid-cols-5">
+        <div className="space-y-4 lg:col-span-3">
+          <Skeleton className="h-96 rounded-xl" />
+          <Skeleton className="h-80 rounded-xl" />
+        </div>
+        <div className="space-y-4 lg:col-span-2">
+          <Skeleton className="h-80 rounded-xl" />
+          <Skeleton className="h-96 rounded-xl" />
+        </div>
+      </div>
+    </>
+  )
+}
 
-  const errors = useMemo(() => {
-    const e: string[] = []
-    const t = draft.tierThresholds
-    if (!(t.A > t.B && t.B > t.C)) e.push("Tier thresholds must be strictly descending (A > B > C).")
-    if (t.C <= 0) e.push("Tier C threshold must be greater than 0.")
-    if (draft.employeeMin < 0 || draft.employeeMax < 0) e.push("Employee counts can't be negative.")
-    if (draft.employeeMin > draft.employeeMax) e.push("Minimum employees must be ≤ maximum employees.")
-    if (draft.revenueMin < 0) e.push("Minimum revenue can't be negative.")
-    if (draft.industries.length === 0) e.push("Select at least one industry.")
-    if (draft.intentDecayDays < 1) e.push("Intent half-life must be at least 1 day.")
-    return e
-  }, [draft])
+function IcpEditor({ icp }: { icp: IcpConfig }) {
+  const user = useCurrentUser()
+  const admin = isAdmin(user.role)
+  const { data: meta } = useMeta()
+  const defaults = useIcpDefaults()
+  const saveIcp = useSaveIcp()
 
-  const preview = useMemo(() => {
-    const pool = accounts.filter((a) => !a.duplicateOf)
-    const rows = pool.map((a) => {
-      const sc = scoreAccount(a, signals, draft)
-      return { account: a, ...sc, delta: sc.score - a.score, tierChanged: sc.tier !== a.tier }
-    })
-    const distribution = TIERS.map((t) => ({
-      tier: `Tier ${t}`,
-      current: pool.filter((a) => a.tier === t).length,
-      draft: rows.filter((r) => r.tier === t).length,
-    }))
-    const top = [...rows].sort((a, b) => b.score - a.score).slice(0, 10)
-    const tierChanges = rows.filter((r) => r.tierChanged).length
-    const scoreChanges = rows.filter((r) => r.delta !== 0).length
-    const promoted = rows.filter((r) => r.tierChanged && r.tier < r.account.tier).length
-    const avgDraft = rows.length ? Math.round(rows.reduce((s, r) => s + r.score, 0) / rows.length) : 0
-    const avgCurrent = pool.length ? Math.round(pool.reduce((s, a) => s + a.score, 0) / pool.length) : 0
-    return { distribution, top, tierChanges, scoreChanges, promoted, demoted: tierChanges - promoted, avgDraft, avgCurrent, total: rows.length }
-  }, [accounts, signals, draft])
+  const industries = meta?.industries ?? INDUSTRIES
+  const countries = meta?.countries ?? COUNTRIES
+  const technologies = meta?.technologies ?? TECHNOLOGIES
+  const fundingStages = meta?.fundingStages ?? FUNDING_STAGES
+
+  const [saved] = useState(() => toIcpInput(icp))
+  const [draft, setDraft] = useState<IcpInput>(saved)
+  const patch = (p: Partial<IcpInput>) => {
+    if (saveIcp.error) saveIcp.reset()
+    setDraft((d) => ({ ...d, ...p }))
+  }
+
+  const dirty = comparable(draft) !== comparable(saved)
+  const isDefault = !!defaults.data && comparable(draft) === comparable(toIcpInput(defaults.data))
+  const errors = validate(draft)
+
+  const serverErrors =
+    saveIcp.error instanceof ApiError
+      ? Object.entries(saveIcp.error.fieldErrors).flatMap(([field, msgs]) => msgs.map((m) => `${field}: ${m}`))
+      : []
+
+  // Live preview: debounce the draft, skip invalid configs, keep showing the previous result while fetching.
+  const debouncedDraft = useDebounced(draft, 400)
+  const preview = useIcpPreview(debouncedDraft, validate(debouncedDraft).length === 0)
+  const p = preview.data
+  const previewStale = preview.isFetching || debouncedDraft !== draft
 
   const save = () => {
-    if (errors.length) return
-    const changed = updateIcp(draft)
-    toast.success("ICP saved & accounts re-scored", {
-      description: `${changed} account${changed === 1 ? "" : "s"} changed tier/score`,
-    })
+    if (errors.length || !admin) return
+    saveIcp.mutate(draft)
   }
 
   const discard = () => {
-    setDraft(icp)
+    saveIcp.reset()
+    setDraft(saved)
     toast("Changes discarded")
   }
 
   const resetDefaults = () => {
-    setDraft(defaultIcp(new Date().toISOString()))
+    if (!defaults.data) return
+    saveIcp.reset()
+    setDraft(toIcpInput(defaults.data))
     toast("Draft reset to defaults", { description: "Save to apply the default configuration." })
   }
 
@@ -211,7 +270,7 @@ export default function ScoringPage() {
             )}
           </span>
         }
-        description={`Define your ideal customer profile and how fit and intent combine into a score. Last saved ${timeAgo(icp.updatedAt)}.`}
+        description={`Define your ideal customer profile and how fit and intent combine into a score. Last saved ${timeAgo(icp.updatedAt)}.${admin ? "" : " Only workspace admins can save changes — edits here are a what-if preview."}`}
         actions={
           <>
             <ConfirmDialog
@@ -221,28 +280,30 @@ export default function ScoringPage() {
               destructive={false}
               onConfirm={resetDefaults}
               trigger={
-                <Button variant="ghost" disabled={isDefault}>
+                <Button variant="ghost" disabled={!defaults.data || isDefault}>
                   <RotateCcwIcon /> Reset to defaults
                 </Button>
               }
             />
-            <Button variant="outline" onClick={discard} disabled={!dirty}>
+            <Button variant="outline" onClick={discard} disabled={!dirty || saveIcp.isPending}>
               <Undo2Icon /> Discard
             </Button>
-            <Button onClick={save} disabled={!dirty || errors.length > 0}>
-              <SaveIcon /> Save & re-score
-            </Button>
+            {admin && (
+              <Button onClick={save} disabled={!dirty || errors.length > 0 || saveIcp.isPending}>
+                {saveIcp.isPending ? <Loader2Icon className="animate-spin" /> : <SaveIcon />} Save & re-score
+              </Button>
+            )}
           </>
         }
       />
 
-      {errors.length > 0 && (
+      {(errors.length > 0 || serverErrors.length > 0) && (
         <Alert variant="destructive">
           <AlertCircleIcon />
-          <AlertTitle>Fix these before saving</AlertTitle>
+          <AlertTitle>{errors.length ? "Fix these before saving" : "The server rejected this configuration"}</AlertTitle>
           <AlertDescription>
             <ul className="list-inside list-disc">
-              {errors.map((e) => (
+              {[...new Set([...errors, ...serverErrors])].map((e) => (
                 <li key={e}>{e}</li>
               ))}
             </ul>
@@ -267,21 +328,21 @@ export default function ScoringPage() {
                   <SelectionHeader
                     label="Industries"
                     count={draft.industries.length}
-                    total={INDUSTRIES.length}
-                    onAll={() => patch({ industries: [...INDUSTRIES] })}
+                    total={industries.length}
+                    onAll={() => patch({ industries: [...industries] })}
                     onNone={() => patch({ industries: [] })}
                   />
-                  <ChipSelect options={INDUSTRIES} value={draft.industries} onChange={(industries) => patch({ industries })} />
+                  <ChipSelect options={industries} value={draft.industries} onChange={(next) => patch({ industries: next })} />
                 </Field>
                 <Field>
                   <SelectionHeader
                     label="Countries"
                     count={draft.countries.length}
-                    total={COUNTRIES.length}
-                    onAll={() => patch({ countries: [...COUNTRIES] })}
+                    total={countries.length}
+                    onAll={() => patch({ countries: [...countries] })}
                     onNone={() => patch({ countries: [] })}
                   />
-                  <ChipSelect options={COUNTRIES} value={draft.countries} onChange={(countries) => patch({ countries })} />
+                  <ChipSelect options={countries} value={draft.countries} onChange={(next) => patch({ countries: next })} />
                 </Field>
                 <div className="grid gap-4 sm:grid-cols-3">
                   <Field>
@@ -325,28 +386,28 @@ export default function ScoringPage() {
                   <SelectionHeader
                     label="Technologies"
                     count={draft.technologies.length}
-                    total={TECHNOLOGIES.length}
-                    onAll={() => patch({ technologies: [...TECHNOLOGIES] })}
+                    total={technologies.length}
+                    onAll={() => patch({ technologies: [...technologies] })}
                     onNone={() => patch({ technologies: [] })}
                   />
                   <ChipSelect
-                    options={TECHNOLOGIES}
+                    options={technologies}
                     value={draft.technologies}
-                    onChange={(technologies) => patch({ technologies })}
+                    onChange={(next) => patch({ technologies: next })}
                   />
                 </Field>
                 <Field>
                   <SelectionHeader
                     label="Funding stages"
                     count={draft.fundingStages.length}
-                    total={FUNDING_STAGES.length}
-                    onAll={() => patch({ fundingStages: [...FUNDING_STAGES] })}
+                    total={fundingStages.length}
+                    onAll={() => patch({ fundingStages: [...fundingStages] })}
                     onNone={() => patch({ fundingStages: [] })}
                   />
                   <ChipSelect
-                    options={FUNDING_STAGES}
+                    options={fundingStages}
                     value={draft.fundingStages}
-                    onChange={(fundingStages) => patch({ fundingStages })}
+                    onChange={(next) => patch({ fundingStages: next })}
                   />
                 </Field>
               </FieldGroup>
@@ -485,9 +546,12 @@ export default function ScoringPage() {
         <div className="space-y-4 lg:sticky lg:top-20 lg:col-span-2">
           <Card>
             <CardHeader>
-              <CardTitle>Live preview</CardTitle>
+              <CardTitle className="flex items-center gap-2">
+                Live preview
+                {previewStale && p && <Loader2Icon className="size-3.5 animate-spin text-muted-foreground" />}
+              </CardTitle>
               <CardDescription>
-                {preview.total} accounts re-scored with the {dirty ? "draft" : "saved"} config
+                {p ? `${p.total} accounts re-scored with the ${dirty ? "draft" : "saved"} config` : "Re-scoring accounts…"}
               </CardDescription>
               {dirty && (
                 <CardAction>
@@ -495,53 +559,68 @@ export default function ScoringPage() {
                 </CardAction>
               )}
             </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid grid-cols-3 gap-2 text-center">
-                <div className="rounded-lg border p-2">
-                  <div className="text-lg font-semibold tabular-nums">{preview.tierChanges}</div>
-                  <div className="text-xs text-muted-foreground">tier changes</div>
-                </div>
-                <div className="rounded-lg border p-2">
-                  <div className="text-lg font-semibold tabular-nums">
-                    <span className="text-emerald-600 dark:text-emerald-400">↑{preview.promoted}</span>{" "}
-                    <span className="text-rose-600 dark:text-rose-400">↓{preview.demoted}</span>
+            <CardContent className={cn("space-y-4 transition-opacity", previewStale && p && "opacity-60")}>
+              {preview.error && !p ? (
+                <QueryError error={preview.error} onRetry={() => preview.refetch()} title="Couldn't compute preview" />
+              ) : !p ? (
+                <>
+                  <div className="grid grid-cols-3 gap-2">
+                    {Array.from({ length: 3 }).map((_, i) => (
+                      <Skeleton key={i} className="h-14" />
+                    ))}
                   </div>
-                  <div className="text-xs text-muted-foreground">promoted / demoted</div>
-                </div>
-                <div className="rounded-lg border p-2">
-                  <div className="text-lg font-semibold tabular-nums">
-                    {preview.avgDraft}
-                    <span
-                      className={cn(
-                        "ml-1 text-xs",
-                        preview.avgDraft > preview.avgCurrent && "text-emerald-600 dark:text-emerald-400",
-                        preview.avgDraft < preview.avgCurrent && "text-rose-600 dark:text-rose-400",
-                        preview.avgDraft === preview.avgCurrent && "text-muted-foreground",
-                      )}
+                  <Skeleton className="h-48 w-full" />
+                </>
+              ) : (
+                <>
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div className="rounded-lg border p-2">
+                      <div className="text-lg font-semibold tabular-nums">{p.tierChanges}</div>
+                      <div className="text-xs text-muted-foreground">tier changes</div>
+                    </div>
+                    <div className="rounded-lg border p-2">
+                      <div className="text-lg font-semibold tabular-nums">
+                        <span className="text-emerald-600 dark:text-emerald-400">↑{p.promoted}</span>{" "}
+                        <span className="text-rose-600 dark:text-rose-400">↓{p.demoted}</span>
+                      </div>
+                      <div className="text-xs text-muted-foreground">promoted / demoted</div>
+                    </div>
+                    <div className="rounded-lg border p-2">
+                      <div className="text-lg font-semibold tabular-nums">
+                        {p.avgDraft}
+                        <span
+                          className={cn(
+                            "ml-1 text-xs",
+                            p.avgDraft > p.avgCurrent && "text-emerald-600 dark:text-emerald-400",
+                            p.avgDraft < p.avgCurrent && "text-rose-600 dark:text-rose-400",
+                            p.avgDraft === p.avgCurrent && "text-muted-foreground",
+                          )}
+                        >
+                          {p.avgDraft - p.avgCurrent >= 0 ? "+" : ""}
+                          {p.avgDraft - p.avgCurrent}
+                        </span>
+                      </div>
+                      <div className="text-xs text-muted-foreground">avg score</div>
+                    </div>
+                  </div>
+                  <ChartContainer config={tierChart} className="h-48 w-full">
+                    <BarChart
+                      data={p.distribution.map((d) => ({ ...d, tier: `Tier ${d.tier}` }))}
+                      margin={{ left: -20, right: 4 }}
                     >
-                      {preview.avgDraft - preview.avgCurrent >= 0 ? "+" : ""}
-                      {preview.avgDraft - preview.avgCurrent}
-                    </span>
-                  </div>
-                  <div className="text-xs text-muted-foreground">avg score</div>
-                </div>
-              </div>
-              <ChartContainer config={tierChart} className="h-48 w-full">
-                <BarChart data={preview.distribution} margin={{ left: -20, right: 4 }}>
-                  <CartesianGrid vertical={false} />
-                  <XAxis dataKey="tier" tickLine={false} axisLine={false} />
-                  <YAxis tickLine={false} axisLine={false} allowDecimals={false} />
-                  <ChartTooltip cursor={false} content={<ChartTooltipContent indicator="dot" />} />
-                  <ChartLegend content={<ChartLegendContent />} />
-                  <Bar dataKey="current" fill="var(--color-current)" radius={4} />
-                  <Bar dataKey="draft" fill="var(--color-draft)" radius={4} />
-                </BarChart>
-              </ChartContainer>
-              {preview.scoreChanges > 0 && (
-                <p className="text-xs text-muted-foreground">
-                  {preview.scoreChanges} account{preview.scoreChanges === 1 ? "" : "s"} would get a different score
-                  {dirty ? "" : " (intent decays over time — save to refresh stored scores)"}.
-                </p>
+                      <CartesianGrid vertical={false} />
+                      <XAxis dataKey="tier" tickLine={false} axisLine={false} />
+                      <YAxis tickLine={false} axisLine={false} allowDecimals={false} />
+                      <ChartTooltip cursor={false} content={<ChartTooltipContent indicator="dot" />} />
+                      <ChartLegend content={<ChartLegendContent />} />
+                      <Bar dataKey="current" fill="var(--color-current)" radius={4} />
+                      <Bar dataKey="draft" fill="var(--color-draft)" radius={4} />
+                    </BarChart>
+                  </ChartContainer>
+                  {preview.error && (
+                    <p className="text-xs text-destructive">Preview is out of date: couldn&apos;t re-score with the latest draft.</p>
+                  )}
+                </>
               )}
             </CardContent>
           </Card>
@@ -551,50 +630,58 @@ export default function ScoringPage() {
               <CardTitle>Top 10 accounts</CardTitle>
               <CardDescription>Ranked by draft score</CardDescription>
             </CardHeader>
-            <CardContent className="px-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="pl-4">Account</TableHead>
-                    <TableHead>Score</TableHead>
-                    <TableHead className="text-right">Δ</TableHead>
-                    <TableHead className="pr-4 text-right">Tier</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {preview.top.map((r) => (
-                    <TableRow key={r.account.id}>
-                      <TableCell className="max-w-44 pl-4">
-                        <Link href={`/accounts/${r.account.id}`} className="flex items-center gap-2 hover:underline">
-                          <CompanyAvatar name={r.account.name} className="size-6 text-[10px]" />
-                          <span className="truncate font-medium">{r.account.name}</span>
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        <ScoreBar value={r.score} />
-                      </TableCell>
-                      <TableCell
-                        className={cn(
-                          "text-right text-xs font-medium tabular-nums",
-                          r.delta > 0 && "text-emerald-600 dark:text-emerald-400",
-                          r.delta < 0 && "text-rose-600 dark:text-rose-400",
-                          r.delta === 0 && "text-muted-foreground",
-                        )}
-                      >
-                        {r.delta > 0 ? `+${r.delta}` : r.delta === 0 ? "—" : r.delta}
-                      </TableCell>
-                      <TableCell className="pr-4 text-right">
-                        <div className="flex items-center justify-end gap-1">
-                          {r.tierChanged && (
-                            <span className="text-xs text-muted-foreground line-through">{r.account.tier}</span>
-                          )}
-                          <TierBadge tier={r.tier} />
-                        </div>
-                      </TableCell>
-                    </TableRow>
+            <CardContent className={cn("px-0 transition-opacity", previewStale && p && "opacity-60")}>
+              {!p ? (
+                <div className="space-y-2 px-4">
+                  {Array.from({ length: 6 }).map((_, i) => (
+                    <Skeleton key={i} className="h-8 w-full" />
                   ))}
-                </TableBody>
-              </Table>
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="pl-4">Account</TableHead>
+                      <TableHead>Score</TableHead>
+                      <TableHead className="text-right">Δ</TableHead>
+                      <TableHead className="pr-4 text-right">Tier</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {p.top.map((r) => (
+                      <TableRow key={r.id}>
+                        <TableCell className="max-w-44 pl-4">
+                          <Link href={`/accounts/${r.id}`} className="flex items-center gap-2 hover:underline">
+                            <CompanyAvatar name={r.name} className="size-6 text-[10px]" />
+                            <span className="truncate font-medium">{r.name}</span>
+                          </Link>
+                        </TableCell>
+                        <TableCell>
+                          <ScoreBar value={r.score} />
+                        </TableCell>
+                        <TableCell
+                          className={cn(
+                            "text-right text-xs font-medium tabular-nums",
+                            r.delta > 0 && "text-emerald-600 dark:text-emerald-400",
+                            r.delta < 0 && "text-rose-600 dark:text-rose-400",
+                            r.delta === 0 && "text-muted-foreground",
+                          )}
+                        >
+                          {r.delta > 0 ? `+${r.delta}` : r.delta === 0 ? "—" : r.delta}
+                        </TableCell>
+                        <TableCell className="pr-4 text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            {r.tier !== r.currentTier && (
+                              <span className="text-xs text-muted-foreground line-through">{r.currentTier}</span>
+                            )}
+                            <TierBadge tier={r.tier} />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
             </CardContent>
           </Card>
         </div>

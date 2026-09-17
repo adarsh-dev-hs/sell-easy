@@ -1,19 +1,21 @@
 "use client"
 
 import { useState } from "react"
-import { toast } from "sonner"
+import { Loader2Icon } from "lucide-react"
+import { QueryError } from "@/components/shared/query-state"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel, FieldSeparator } from "@/components/ui/field"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
-
-const STORAGE_KEY = "selleasy-notif-prefs"
+import { usePreferences, useSavePreferences } from "@/lib/api"
+import type { UserPreferences } from "@/lib/types"
 
 const EVENTS = [
-  { key: "highIntent", label: "New high-intent signal", description: "When a Tier A/B account crosses your intent threshold." },
-  { key: "draftsAwaiting", label: "Drafts awaiting approval", description: "The orchestration agent drafted outreach that needs review." },
+  { key: "highIntentSignal", label: "New high-intent signal", description: "When a Tier A/B account crosses your intent threshold." },
+  { key: "draftsAwaitingApproval", label: "Drafts awaiting approval", description: "The orchestration agent drafted outreach that needs review." },
   { key: "positiveReplies", label: "Positive replies", description: "A prospect replied with interest or asked to meet." },
-  { key: "dealStage", label: "Deal stage changes", description: "Deals you own move stages, locally or from the CRM." },
+  { key: "dealStageChanges", label: "Deal stage changes", description: "Deals you own move stages, locally or from the CRM." },
   { key: "integrationErrors", label: "Integration errors", description: "A vendor sync fails or an API key is rejected." },
 ] as const
 
@@ -23,61 +25,55 @@ const CHANNELS = [
   { key: "slack", label: "Slack", description: "Direct message from the SellEasy bot." },
 ] as const
 
-type Prefs = Record<(typeof EVENTS)[number]["key"] | (typeof CHANNELS)[number]["key"], boolean>
-
-const DEFAULTS: Prefs = {
-  highIntent: true,
-  draftsAwaiting: true,
-  positiveReplies: true,
-  dealStage: false,
-  integrationErrors: true,
-  inApp: true,
-  email: true,
-  slack: false,
-}
-
-function loadPrefs(): Prefs {
-  try {
-    const raw = typeof window !== "undefined" ? window.localStorage.getItem(STORAGE_KEY) : null
-    if (!raw) return DEFAULTS
-    const parsed = JSON.parse(raw) as Partial<Prefs>
-    const out = { ...DEFAULTS }
-    for (const k of Object.keys(DEFAULTS) as (keyof Prefs)[]) if (typeof parsed[k] === "boolean") out[k] = parsed[k]
-    return out
-  } catch {
-    return DEFAULTS
-  }
-}
+type Group = keyof UserPreferences
 
 export function NotificationsTab() {
-  const [saved, setSaved] = useState<Prefs>(loadPrefs)
-  const [prefs, setPrefs] = useState<Prefs>(saved)
-  const dirty = (Object.keys(prefs) as (keyof Prefs)[]).some((k) => prefs[k] !== saved[k])
-  const noChannel = !prefs.inApp && !prefs.email && !prefs.slack
+  const prefs = usePreferences()
 
-  const toggle = (k: keyof Prefs, v: boolean) => setPrefs((p) => ({ ...p, [k]: v }))
+  if (prefs.isError) return <QueryError error={prefs.error} onRetry={() => prefs.refetch()} />
+  if (!prefs.data) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Notifications</CardTitle>
+          <CardDescription>Choose what SellEasy alerts you about and where.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {Array.from({ length: 8 }).map((_, n) => (
+            <Skeleton key={n} className="h-10 w-full" />
+          ))}
+        </CardContent>
+      </Card>
+    )
+  }
+  // Re-key when the saved preferences change so the draft re-initialises from the server.
+  return <NotificationsForm key={JSON.stringify(prefs.data)} saved={prefs.data} />
+}
+
+function NotificationsForm({ saved }: { saved: UserPreferences }) {
+  const savePrefs = useSavePreferences()
+  const [prefs, setPrefs] = useState<UserPreferences>(saved)
+
+  const get = (group: Group, key: string) => prefs[group][key] === true
+  const dirty = (["notifications", "channels"] as const).some((g) =>
+    [...EVENTS, ...CHANNELS].some((item) => (prefs[g][item.key] === true) !== (saved[g][item.key] === true)),
+  )
+  const noChannel = !CHANNELS.some((c) => get("channels", c.key))
+
+  const toggle = (group: Group, key: string, v: boolean) => setPrefs((p) => ({ ...p, [group]: { ...p[group], [key]: v } }))
 
   const save = () => {
-    if (noChannel) {
-      toast.error("Enable at least one delivery channel")
-      return
-    }
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs))
-      setSaved(prefs)
-      toast.success("Notification preferences saved")
-    } catch {
-      toast.error("Couldn't save preferences in this browser")
-    }
+    if (noChannel) return
+    savePrefs.mutate(prefs)
   }
 
-  const row = (item: { key: keyof Prefs; label: string; description: string }) => (
+  const row = (group: Group, item: { key: string; label: string; description: string }) => (
     <Field key={item.key} orientation="horizontal">
       <FieldContent>
         <FieldLabel htmlFor={`notif-${item.key}`}>{item.label}</FieldLabel>
         <FieldDescription>{item.description}</FieldDescription>
       </FieldContent>
-      <Switch id={`notif-${item.key}`} checked={prefs[item.key]} onCheckedChange={(v) => toggle(item.key, v)} />
+      <Switch id={`notif-${item.key}`} checked={get(group, item.key)} onCheckedChange={(v) => toggle(group, item.key, v)} />
     </Field>
   )
 
@@ -90,18 +86,19 @@ export function NotificationsTab() {
       <CardContent>
         <FieldGroup className="gap-4">
           <h3 className="text-sm font-medium">Events</h3>
-          {EVENTS.map(row)}
+          {EVENTS.map((item) => row("notifications", item))}
           <FieldSeparator />
           <h3 className="text-sm font-medium">Channels</h3>
-          {CHANNELS.map(row)}
+          {CHANNELS.map((item) => row("channels", item))}
           {noChannel && <p className="text-sm text-destructive">Enable at least one channel to receive notifications.</p>}
         </FieldGroup>
       </CardContent>
       <CardFooter className="justify-end gap-2">
-        <Button variant="ghost" disabled={!dirty} onClick={() => setPrefs(saved)}>
+        <Button variant="ghost" disabled={!dirty || savePrefs.isPending} onClick={() => setPrefs(saved)}>
           Discard
         </Button>
-        <Button disabled={!dirty} onClick={save}>
+        <Button disabled={!dirty || noChannel || savePrefs.isPending} onClick={save}>
+          {savePrefs.isPending && <Loader2Icon className="animate-spin" />}
           Save preferences
         </Button>
       </CardFooter>

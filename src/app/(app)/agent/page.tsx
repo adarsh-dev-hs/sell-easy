@@ -1,6 +1,6 @@
 "use client"
 
-import { Suspense, useCallback, useMemo, useState } from "react"
+import { Suspense, useCallback, useState } from "react"
 import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import {
@@ -15,6 +15,7 @@ import {
   CpuIcon,
   InboxIcon,
   ListChecksIcon,
+  Loader2Icon,
   PencilIcon,
   PlusIcon,
   ShieldCheckIcon,
@@ -43,6 +44,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -55,21 +57,44 @@ import { CompanyAvatar } from "@/components/shared/avatars"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
 import { EmptyState } from "@/components/shared/empty-state"
 import { PageHeader } from "@/components/shared/page-header"
+import { QueryError, TableSkeleton } from "@/components/shared/query-state"
 import { ScoreBar, TierBadge } from "@/components/shared/score"
 import { StatCard } from "@/components/shared/stat-card"
 import { SignalIcon, StatusBadge } from "@/components/shared/status"
+import {
+  canWrite,
+  errorMessage,
+  isAdmin,
+  type PlaybookInput,
+  type PlaybookRecord,
+  useAgentRun,
+  useAgentRuns,
+  useAgentSettings,
+  useAgentStats,
+  useCreatePlaybook,
+  useCurrentUser,
+  useDeletePlaybook,
+  useDrafts,
+  useMeta,
+  usePlaybooks,
+  useProcessPending,
+  useSequences,
+  useSetAutopilot,
+  useSignalStats,
+  useSimulateSignal,
+  useUpdatePlaybook,
+} from "@/lib/api"
 import { ACTION_LABELS, SIGNAL_LABELS } from "@/lib/constants"
 import { dateTime, fullName, percent, timeAgo } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
-import type { AgentActionType, AgentRun, PlaybookRule, SignalType, Tier } from "@/lib/types"
+import type { AgentActionType, AgentRun, SignalType, Tier } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 const TABS = ["runs", "approvals", "playbooks"] as const
 type TabKey = (typeof TABS)[number]
 const PAGE_SIZE = 25
-const DAY = 86_400_000
-/** Wall-clock read, kept outside render bodies (memoized per data change). */
-const currentTime = () => Date.now()
+/** Shared query params so the header badge and the Approvals tab reuse one cache entry. */
+const PENDING_DRAFTS = { status: ["pending"], pageSize: 50, sort: "createdAt:desc" } as const satisfies Parameters<typeof useDrafts>[0]
+const REVIEWED_DRAFTS = { status: ["sent", "rejected"], pageSize: 10, sort: "createdAt:desc" } as const satisfies Parameters<typeof useDrafts>[0]
 const ALL_TIERS: Tier[] = ["A", "B", "C", "D"]
 const ACTION_KEYS = Object.keys(ACTION_LABELS) as AgentActionType[]
 const SIGNAL_TYPES = Object.keys(SIGNAL_LABELS) as SignalType[]
@@ -97,14 +122,23 @@ function AgentPageInner() {
   const pathname = usePathname()
   const params = useSearchParams()
 
-  const runs = useStore((s) => s.runs)
-  const drafts = useStore((s) => s.drafts)
-  const signals = useStore((s) => s.signals)
-  const autopilot = useStore((s) => s.autopilot)
-  const setAutopilot = useStore((s) => s.setAutopilot)
-  const simulateSignal = useStore((s) => s.simulateSignal)
-  const processPending = useStore((s) => s.processPending)
+  const user = useCurrentUser()
+  const writable = canWrite(user.role)
+  const meta = useMeta()
+  const settings = useAgentSettings()
+  const setAutopilot = useSetAutopilot()
+  const statsQuery = useAgentStats()
+  const signalStats = useSignalStats()
+  const pendingDraftsQuery = useDrafts({ ...PENDING_DRAFTS, status: [...PENDING_DRAFTS.status] })
+  const simulateSignal = useSimulateSignal()
+  const processPending = useProcessPending()
   const showRun = useRunToast()
+
+  const autopilot = !!settings.data?.autopilot
+  const stats = statsQuery.data
+  const pendingDraftCount = pendingDraftsQuery.data?.meta.total ?? 0
+  const pendingSignals = signalStats.data?.unprocessed ?? 0
+  const simulationEnabled = !!meta.data?.features.simulation
 
   const tabParam = params.get("tab")
   const tab: TabKey = (TABS as readonly string[]).includes(tabParam ?? "") ? (tabParam as TabKey) : "runs"
@@ -123,46 +157,30 @@ function AgentPageInner() {
     [params, pathname, router],
   )
 
-  const pendingDrafts = useMemo(() => drafts.filter((d) => d.status === "pending"), [drafts])
-  const pendingSignals = useMemo(() => signals.filter((s) => !s.processed).length, [signals])
-
-  const stats = useMemo(() => {
-    const now = currentTime()
-    const startOfDay = new Date(now).setHours(0, 0, 0, 0)
-    const today = runs.filter((r) => new Date(r.startedAt).getTime() >= startOfDay).length
-    const week = runs.filter((r) => now - new Date(r.startedAt).getTime() <= 7 * DAY).length
-    const actions = runs.reduce(
-      (n, r) => n + r.steps.filter((s) => s.status === "done" && s.action !== "evaluate" && s.action !== "rescore").length,
-      0,
-    )
-    const completed = runs.filter((r) => r.status === "completed").length
-    const failed = runs.filter((r) => r.status === "failed").length
-    const decided = completed + failed
-    return { today, week, actions, successRate: decided ? (completed / decided) * 100 : 0, completed, failed }
-  }, [runs])
-
   return (
     <>
       <PageHeader
         title="Orchestration Agent"
         description="The agent watches signals, re-scores accounts and runs your playbooks — routing, drafting and enrolling automatically."
         actions={
-          <>
-            {pendingSignals > 0 && (
-              <Button
-                variant="outline"
-                onClick={() => {
-                  const n = processPending()
-                  toast.success(`Processed ${n} pending signal${n === 1 ? "" : "s"}`)
-                }}
-              >
-                <CpuIcon /> Process {pendingSignals} pending
-              </Button>
-            )}
-            <Button onClick={() => showRun(simulateSignal(), "Simulated signal")}>
-              <ShuffleIcon /> Simulate signal
-            </Button>
-          </>
+          writable && (
+            <>
+              {pendingSignals > 0 && (
+                <Button variant="outline" onClick={() => processPending.mutate()} disabled={processPending.isPending}>
+                  {processPending.isPending ? <Loader2Icon className="animate-spin" /> : <CpuIcon />} Process {pendingSignals}{" "}
+                  pending
+                </Button>
+              )}
+              {simulationEnabled && (
+                <Button
+                  disabled={simulateSignal.isPending}
+                  onClick={() => simulateSignal.mutate(undefined, { onSuccess: (r) => showRun(r.run, `Simulated: ${r.signal.title}`) })}
+                >
+                  {simulateSignal.isPending ? <Loader2Icon className="animate-spin" /> : <ShuffleIcon />} Simulate signal
+                </Button>
+              )}
+            </>
+          )
         }
       />
 
@@ -193,33 +211,49 @@ function AgentPageInner() {
             </Label>
             <Switch
               id="autopilot"
-              checked={autopilot}
-              onCheckedChange={(on) => {
-                setAutopilot(on)
-                toast(on ? "Autopilot enabled" : "Autopilot paused", {
-                  description: on ? "New signals will be processed automatically." : "New signals will queue until processed.",
-                })
-              }}
+              checked={setAutopilot.isPending ? setAutopilot.variables : autopilot}
+              disabled={!writable || !settings.data || setAutopilot.isPending}
+              onCheckedChange={(on) => setAutopilot.mutate(on)}
             />
           </div>
         </CardContent>
       </Card>
 
+      {statsQuery.error && (
+        <QueryError error={statsQuery.error} onRetry={() => statsQuery.refetch()} title="Couldn't load agent stats" />
+      )}
+
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Runs today" value={stats.today} icon={ActivityIcon} hint={`${stats.week} in the last 7 days`} />
-        <StatCard label="Actions taken" value={stats.actions} icon={ZapIcon} hint={`across ${runs.length} runs`} />
-        <StatCard
-          label="Awaiting approval"
-          value={pendingDrafts.length}
-          icon={ClockIcon}
-          hint={pendingDrafts.length ? "drafts need review" : "queue is clear"}
-        />
-        <StatCard
-          label="Success rate"
-          value={percent(stats.successRate, 0)}
-          icon={CheckCircle2Icon}
-          hint={`${stats.completed} completed · ${stats.failed} failed`}
-        />
+        {!stats && statsQuery.isLoading ? (
+          Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-28 rounded-xl" />)
+        ) : (
+          <>
+            <StatCard
+              label="Runs today"
+              value={stats?.runsToday ?? 0}
+              icon={ActivityIcon}
+              hint={`${stats?.runs7d ?? 0} in the last 7 days`}
+            />
+            <StatCard
+              label="Actions taken"
+              value={stats?.actionsTaken ?? 0}
+              icon={ZapIcon}
+              hint={`across ${stats?.totalRuns ?? 0} runs`}
+            />
+            <StatCard
+              label="Awaiting approval"
+              value={pendingDraftCount}
+              icon={ClockIcon}
+              hint={pendingDraftCount ? "drafts need review" : "queue is clear"}
+            />
+            <StatCard
+              label="Success rate"
+              value={percent(stats?.successRate ?? 0, 0)}
+              icon={CheckCircle2Icon}
+              hint={`${stats?.completed ?? 0} completed · ${stats?.failed ?? 0} failed`}
+            />
+          </>
+        )}
       </div>
 
       <Tabs value={tab} onValueChange={(v) => setParams({ tab: v === "runs" ? null : v })} className="gap-4">
@@ -229,8 +263,8 @@ function AgentPageInner() {
           </TabsTrigger>
           <TabsTrigger value="approvals">
             <InboxIcon /> Approvals
-            {pendingDrafts.length > 0 && (
-              <Badge className="h-4 min-w-4 px-1 text-[10px] tabular-nums">{pendingDrafts.length}</Badge>
+            {pendingDraftCount > 0 && (
+              <Badge className="h-4 min-w-4 px-1 text-[10px] tabular-nums">{pendingDraftCount}</Badge>
             )}
           </TabsTrigger>
           <TabsTrigger value="playbooks">
@@ -258,29 +292,21 @@ function AgentPageInner() {
 // ---------------------------------------------------------------------------
 
 function RunsTab({ onOpen }: { onOpen: (id: string) => void }) {
-  const runs = useStore((s) => s.runs)
-  const rules = useStore((s) => s.rules)
-  const lookup = useLookup()
   const [status, setStatus] = useState<AgentRun["status"] | "all">("all")
-  const [page, setPage] = useState(0)
+  const [page, setPage] = useState(1)
+  const runsQuery = useAgentRuns({
+    page,
+    pageSize: PAGE_SIZE,
+    status: status === "all" ? undefined : [status],
+    sort: "startedAt:desc",
+  })
+  const { data: stats } = useAgentStats()
 
-  const ruleName = useMemo(() => new Map(rules.map((r) => [r.id, r.name])), [rules])
-  const filtered = useMemo(
-    () =>
-      runs
-        .filter((r) => status === "all" || r.status === status)
-        .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()),
-    [runs, status],
-  )
-  const counts = useMemo(() => {
-    const m: Record<string, number> = {}
-    for (const r of runs) m[r.status] = (m[r.status] ?? 0) + 1
-    return m
-  }, [runs])
-
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
-  const current = Math.min(page, pageCount - 1)
-  const rows = filtered.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE)
+  const rows = runsQuery.data?.data ?? []
+  const total = runsQuery.data?.meta.total ?? 0
+  const count = (s: AgentRun["status"]) => stats?.byStatus.find((x) => x.status === s)?.count ?? 0
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const current = Math.min(page, pageCount)
 
   return (
     <Card>
@@ -292,17 +318,18 @@ function RunsTab({ onOpen }: { onOpen: (id: string) => void }) {
             value={status}
             onValueChange={(v) => {
               setStatus(v as typeof status)
-              setPage(0)
+              setPage(1)
             }}
           >
             <SelectTrigger className="w-48">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All statuses ({runs.length})</SelectItem>
+              <SelectItem value="all">All statuses{stats ? ` (${stats.totalRuns})` : ""}</SelectItem>
               {RUN_STATUSES.map((s) => (
                 <SelectItem key={s} value={s}>
-                  {s === "awaiting_approval" ? "Awaiting approval" : s.charAt(0).toUpperCase() + s.slice(1)} ({counts[s] ?? 0})
+                  {s === "awaiting_approval" ? "Awaiting approval" : s.charAt(0).toUpperCase() + s.slice(1)}
+                  {stats ? ` (${count(s)})` : ""}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -310,11 +337,15 @@ function RunsTab({ onOpen }: { onOpen: (id: string) => void }) {
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-4">
-        {filtered.length === 0 ? (
+        {runsQuery.error ? (
+          <QueryError error={runsQuery.error} onRetry={() => runsQuery.refetch()} title="Couldn't load agent runs" />
+        ) : !runsQuery.data ? (
+          <TableSkeleton rows={8} className="rounded-lg border" />
+        ) : rows.length === 0 ? (
           <EmptyState icon={BotIcon} title="No agent runs" description="Simulate or ingest a signal to see the agent in action." />
         ) : (
           <>
-            <div className="overflow-hidden rounded-lg border">
+            <div className={cn("overflow-hidden rounded-lg border transition-opacity", runsQuery.isPlaceholderData && "opacity-60")}>
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -329,7 +360,7 @@ function RunsTab({ onOpen }: { onOpen: (id: string) => void }) {
                 </TableHeader>
                 <TableBody>
                   {rows.map((r) => {
-                    const account = lookup.account(r.accountId)
+                    const account = r.account
                     return (
                       <TableRow key={r.id} className="cursor-pointer" onClick={() => onOpen(r.id)}>
                         <TableCell className="whitespace-nowrap text-muted-foreground">{timeAgo(r.startedAt)}</TableCell>
@@ -352,7 +383,7 @@ function RunsTab({ onOpen }: { onOpen: (id: string) => void }) {
                         <TableCell className="max-w-72 truncate">{r.trigger}</TableCell>
                         <TableCell className="max-w-48 truncate">
                           {r.ruleId ? (
-                            (ruleName.get(r.ruleId) ?? <span className="text-muted-foreground">Deleted playbook</span>)
+                            (r.ruleName ?? <span className="text-muted-foreground">Deleted playbook</span>)
                           ) : (
                             <span className="text-muted-foreground">—</span>
                           )}
@@ -372,19 +403,19 @@ function RunsTab({ onOpen }: { onOpen: (id: string) => void }) {
             </div>
             <div className="flex items-center justify-between gap-2 text-sm text-muted-foreground">
               <span>
-                {filtered.length} run{filtered.length === 1 ? "" : "s"}
+                {total} run{total === 1 ? "" : "s"}
               </span>
               <div className="flex items-center gap-2">
                 <span className="tabular-nums">
-                  Page {current + 1} / {pageCount}
+                  Page {current} / {pageCount}
                 </span>
-                <Button variant="outline" size="icon-sm" disabled={current === 0} onClick={() => setPage(current - 1)} aria-label="Previous page">
+                <Button variant="outline" size="icon-sm" disabled={current <= 1} onClick={() => setPage(current - 1)} aria-label="Previous page">
                   <ChevronLeftIcon />
                 </Button>
                 <Button
                   variant="outline"
                   size="icon-sm"
-                  disabled={current >= pageCount - 1}
+                  disabled={current >= pageCount}
                   onClick={() => setPage(current + 1)}
                   aria-label="Next page"
                 >
@@ -400,33 +431,49 @@ function RunsTab({ onOpen }: { onOpen: (id: string) => void }) {
 }
 
 function RunSheet({ runId, onClose }: { runId: string | null; onClose: () => void }) {
-  const runs = useStore((s) => s.runs)
-  const rules = useStore((s) => s.rules)
-  const signals = useStore((s) => s.signals)
-  const drafts = useStore((s) => s.drafts)
-  const lookup = useLookup()
+  const { data: run, isLoading, error, refetch } = useAgentRun(runId)
 
-  const run = useMemo(() => runs.find((r) => r.id === runId), [runs, runId])
-  const rule = useMemo(() => rules.find((r) => r.id === run?.ruleId), [rules, run])
-  const signal = useMemo(() => signals.find((s) => s.id === run?.signalId), [signals, run])
-  const runDrafts = useMemo(() => drafts.filter((d) => d.runId === runId), [drafts, runId])
+  const runDrafts = run?.drafts ?? []
   const pending = runDrafts.find((d) => d.status === "pending")
   const reviewed = runDrafts.filter((d) => d.status !== "pending")
-  const account = lookup.account(run?.accountId)
+  const account = run?.account
+  const signal = run?.signal
 
   return (
     <Sheet open={!!runId} onOpenChange={(o) => !o && onClose()}>
       <SheetContent className="w-full sm:max-w-xl">
-        {!run ? (
-          <SheetHeader>
-            <SheetTitle>Run not found</SheetTitle>
-            <SheetDescription>This agent run no longer exists.</SheetDescription>
-          </SheetHeader>
+        {isLoading ? (
+          <>
+            <SheetHeader>
+              <SheetTitle className="sr-only">Loading run</SheetTitle>
+              <Skeleton className="h-6 w-2/3" />
+              <Skeleton className="h-4 w-1/2" />
+            </SheetHeader>
+            <div className="space-y-3 px-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Skeleton className="h-20" />
+                <Skeleton className="h-20" />
+              </div>
+              <Skeleton className="h-60 w-full" />
+            </div>
+          </>
+        ) : !run ? (
+          <>
+            <SheetHeader>
+              <SheetTitle>Run not found</SheetTitle>
+              <SheetDescription>This agent run no longer exists.</SheetDescription>
+            </SheetHeader>
+            {error && (
+              <div className="px-4">
+                <QueryError error={error} onRetry={() => refetch()} title="Couldn't load run" />
+              </div>
+            )}
+          </>
         ) : (
           <>
             <SheetHeader>
               <div className="flex items-center gap-2 pr-8">
-                <SheetTitle>{rule?.name ?? (run.ruleId ? "Deleted playbook" : "Signal evaluation")}</SheetTitle>
+                <SheetTitle>{run.ruleName ?? (run.ruleId ? "Deleted playbook" : "Signal evaluation")}</SheetTitle>
                 <StatusBadge status={run.status} />
               </div>
               <SheetDescription>
@@ -510,38 +557,48 @@ function RunSheet({ runId, onClose }: { runId: string | null; onClose: () => voi
   )
 }
 
+
 // ---------------------------------------------------------------------------
 // Approvals tab
 // ---------------------------------------------------------------------------
 
 function ApprovalsTab() {
-  const drafts = useStore((s) => s.drafts)
-  const lookup = useLookup()
   const [open, setOpen] = useState(false)
+  const pendingQuery = useDrafts({ ...PENDING_DRAFTS, status: [...PENDING_DRAFTS.status] })
+  const reviewedQuery = useDrafts({ ...REVIEWED_DRAFTS, status: [...REVIEWED_DRAFTS.status] })
 
-  const pending = useMemo(
-    () => drafts.filter((d) => d.status === "pending").sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-    [drafts],
-  )
-  const reviewed = useMemo(
-    () => drafts.filter((d) => d.status !== "pending").sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20),
-    [drafts],
-  )
+  const pending = pendingQuery.data?.data ?? []
+  const reviewed = reviewedQuery.data?.data ?? []
+  const pendingTotal = pendingQuery.data?.meta.total ?? 0
 
   return (
     <div className="space-y-4">
-      {pending.length === 0 ? (
+      {pendingQuery.error ? (
+        <QueryError error={pendingQuery.error} onRetry={() => pendingQuery.refetch()} title="Couldn't load drafts" />
+      ) : !pendingQuery.data ? (
+        <div className="grid gap-4 xl:grid-cols-2">
+          <Skeleton className="h-96 rounded-xl" />
+          <Skeleton className="h-96 rounded-xl" />
+        </div>
+      ) : pending.length === 0 ? (
         <EmptyState
           icon={ShieldCheckIcon}
           title="All caught up"
           description="No drafts are waiting for review. Playbooks that require approval will queue drafts here."
         />
       ) : (
-        <div className="grid gap-4 xl:grid-cols-2">
-          {pending.map((d) => (
-            <DraftReviewCard key={d.id} draft={d} />
-          ))}
-        </div>
+        <>
+          <div className="grid gap-4 xl:grid-cols-2">
+            {pending.map((d) => (
+              <DraftReviewCard key={d.id} draft={d} />
+            ))}
+          </div>
+          {pendingTotal > pending.length && (
+            <p className="text-center text-sm text-muted-foreground">
+              Showing the {pending.length} newest of {pendingTotal} pending drafts — review these to load more.
+            </p>
+          )}
+        </>
       )}
 
       <Collapsible open={open} onOpenChange={setOpen}>
@@ -550,39 +607,43 @@ function ApprovalsTab() {
             <button type="button" className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left">
               <div>
                 <div className="font-medium">Recently reviewed</div>
-                <div className="text-sm text-muted-foreground">{reviewed.length} sent or rejected drafts</div>
+                <div className="text-sm text-muted-foreground">
+                  {reviewedQuery.data ? `${reviewed.length} sent or rejected drafts` : "Loading…"}
+                </div>
               </div>
               <ChevronDownIcon className={cn("size-4 text-muted-foreground transition-transform", open && "rotate-180")} />
             </button>
           </CollapsibleTrigger>
           <CollapsibleContent>
             <Separator />
-            {reviewed.length === 0 ? (
+            {reviewedQuery.error ? (
+              <div className="p-4">
+                <QueryError error={reviewedQuery.error} onRetry={() => reviewedQuery.refetch()} />
+              </div>
+            ) : !reviewedQuery.data ? (
+              <TableSkeleton rows={3} />
+            ) : reviewed.length === 0 ? (
               <p className="p-4 text-sm text-muted-foreground">Nothing reviewed yet.</p>
             ) : (
               <ul className="divide-y">
-                {reviewed.map((d) => {
-                  const account = lookup.account(d.accountId)
-                  const contact = lookup.contact(d.contactId)
-                  return (
-                    <li key={d.id} className="flex items-center gap-3 px-4 py-3">
-                      {account && <CompanyAvatar name={account.name} />}
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-sm font-medium">{d.subject}</div>
-                        <div className="truncate text-xs text-muted-foreground">
-                          {account?.name ?? "Unknown"} · {contact ? fullName(contact) : "Unknown contact"} ·{" "}
-                          {d.channel === "linkedin" ? "LinkedIn" : "Email"} · {timeAgo(d.createdAt)}
-                        </div>
+                {reviewed.map((d) => (
+                  <li key={d.id} className="flex items-center gap-3 px-4 py-3">
+                    {d.account && <CompanyAvatar name={d.account.name} />}
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium">{d.subject}</div>
+                      <div className="truncate text-xs text-muted-foreground">
+                        {d.account?.name ?? "Unknown"} · {d.contact ? fullName(d.contact) : "Unknown contact"} ·{" "}
+                        {d.channel === "linkedin" ? "LinkedIn" : "Email"} · {timeAgo(d.createdAt)}
                       </div>
-                      {d.runId && (
-                        <Button asChild variant="ghost" size="xs" className="hidden sm:inline-flex">
-                          <Link href={`/agent?tab=approvals&run=${d.runId}`}>View run</Link>
-                        </Button>
-                      )}
-                      <StatusBadge status={d.status} />
-                    </li>
-                  )
-                })}
+                    </div>
+                    {d.runId && (
+                      <Button asChild variant="ghost" size="xs" className="hidden sm:inline-flex">
+                        <Link href={`/agent?tab=approvals&run=${d.runId}`}>View run</Link>
+                      </Button>
+                    )}
+                    <StatusBadge status={d.status} />
+                  </li>
+                ))}
               </ul>
             )}
           </CollapsibleContent>
@@ -597,42 +658,58 @@ function ApprovalsTab() {
 // ---------------------------------------------------------------------------
 
 function PlaybooksTab() {
-  const rules = useStore((s) => s.rules)
-  const sequences = useStore((s) => s.sequences)
-  const updateRule = useStore((s) => s.updateRule)
-  const deleteRule = useStore((s) => s.deleteRule)
-  const [editing, setEditing] = useState<PlaybookRule | "new" | null>(null)
+  const user = useCurrentUser()
+  const admin = isAdmin(user.role)
+  const playbooks = usePlaybooks()
+  const updatePlaybook = useUpdatePlaybook()
+  const deletePlaybook = useDeletePlaybook()
+  const [editing, setEditing] = useState<PlaybookRecord | "new" | null>(null)
 
-  const seqName = useMemo(() => new Map(sequences.map((s) => [s.id, s.name])), [sequences])
+  const rules = playbooks.data ?? []
 
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm text-muted-foreground">
           Playbooks are evaluated in order; the first enabled playbook whose trigger, minimum score and tiers match runs.
+          {!admin && " Only workspace admins can change playbooks."}
         </p>
-        <Button onClick={() => setEditing("new")}>
-          <PlusIcon /> New playbook
-        </Button>
+        {admin && (
+          <Button onClick={() => setEditing("new")}>
+            <PlusIcon /> New playbook
+          </Button>
+        )}
       </div>
 
-      {rules.length === 0 ? (
+      {playbooks.error ? (
+        <QueryError error={playbooks.error} onRetry={() => playbooks.refetch()} title="Couldn't load playbooks" />
+      ) : !playbooks.data ? (
+        <div className="grid gap-4 lg:grid-cols-2">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-72 rounded-xl" />
+          ))}
+        </div>
+      ) : rules.length === 0 ? (
         <EmptyState
           icon={WorkflowIcon}
           title="No playbooks yet"
           description="Create a playbook to tell the agent what to do when signals arrive."
           action={
-            <Button onClick={() => setEditing("new")}>
-              <PlusIcon /> New playbook
-            </Button>
+            admin ? (
+              <Button onClick={() => setEditing("new")}>
+                <PlusIcon /> New playbook
+              </Button>
+            ) : undefined
           }
         />
       ) : (
         <div className="grid gap-4 lg:grid-cols-2">
           {rules.map((r, i) => {
             const flow = [r.trigger === "any" ? "Any signal" : SIGNAL_LABELS[r.trigger], ...r.actions.map((a) => SHORT_ACTION[a])]
+            const toggling = updatePlaybook.isPending && updatePlaybook.variables?.id === r.id
+            const enabled = toggling && updatePlaybook.variables?.enabled !== undefined ? updatePlaybook.variables.enabled : r.enabled
             return (
-              <Card key={r.id} className={cn(!r.enabled && "opacity-70")}>
+              <Card key={r.id} className={cn(!enabled && "opacity-70")}>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <span className="text-xs font-normal text-muted-foreground tabular-nums">#{i + 1}</span>
@@ -641,12 +718,15 @@ function PlaybooksTab() {
                   <CardDescription className="line-clamp-2">{r.description || "No description"}</CardDescription>
                   <CardAction>
                     <Switch
-                      checked={r.enabled}
-                      aria-label={r.enabled ? "Disable playbook" : "Enable playbook"}
-                      onCheckedChange={(enabled) => {
-                        updateRule(r.id, { enabled })
-                        toast(enabled ? `“${r.name}” enabled` : `“${r.name}” disabled`)
-                      }}
+                      checked={enabled}
+                      disabled={!admin || toggling}
+                      aria-label={enabled ? "Disable playbook" : "Enable playbook"}
+                      onCheckedChange={(on) =>
+                        updatePlaybook.mutate(
+                          { id: r.id, enabled: on },
+                          { onSuccess: () => toast(on ? `“${r.name}” enabled` : `“${r.name}” disabled`) },
+                        )
+                      }
                     />
                   </CardAction>
                 </CardHeader>
@@ -705,34 +785,33 @@ function PlaybooksTab() {
                   <div className="flex items-center gap-2 text-sm">
                     <ListChecksIcon className="size-4 text-muted-foreground" />
                     <span className="text-muted-foreground">Sequence:</span>
-                    {r.sequenceId && seqName.get(r.sequenceId) ? (
+                    {r.sequenceId && r.sequenceName ? (
                       <Link href={`/outreach/${r.sequenceId}`} className="truncate font-medium hover:underline">
-                        {seqName.get(r.sequenceId)}
+                        {r.sequenceName}
                       </Link>
                     ) : (
                       <span className="text-muted-foreground">None</span>
                     )}
                   </div>
                 </CardContent>
-                <CardFooter className="justify-end gap-2">
-                  <ConfirmDialog
-                    title={`Delete “${r.name}”?`}
-                    description="The agent will stop running this playbook. Past runs are kept."
-                    confirmLabel="Delete"
-                    onConfirm={() => {
-                      deleteRule(r.id)
-                      toast.success("Playbook deleted")
-                    }}
-                    trigger={
-                      <Button variant="ghost" size="sm">
-                        <Trash2Icon /> Delete
-                      </Button>
-                    }
-                  />
-                  <Button variant="outline" size="sm" onClick={() => setEditing(r)}>
-                    <PencilIcon /> Edit
-                  </Button>
-                </CardFooter>
+                {admin && (
+                  <CardFooter className="justify-end gap-2">
+                    <ConfirmDialog
+                      title={`Delete “${r.name}”?`}
+                      description="The agent will stop running this playbook. Past runs are kept."
+                      confirmLabel="Delete"
+                      onConfirm={() => deletePlaybook.mutate(r.id)}
+                      trigger={
+                        <Button variant="ghost" size="sm" disabled={deletePlaybook.isPending && deletePlaybook.variables === r.id}>
+                          <Trash2Icon /> Delete
+                        </Button>
+                      }
+                    />
+                    <Button variant="outline" size="sm" onClick={() => setEditing(r)}>
+                      <PencilIcon /> Edit
+                    </Button>
+                  </CardFooter>
+                )}
               </Card>
             )
           })}
@@ -756,10 +835,12 @@ function PlaybooksTab() {
 
 const NO_SEQ = "__none__"
 
-function PlaybookForm({ rule, onDone }: { rule?: PlaybookRule; onDone: () => void }) {
-  const sequences = useStore((s) => s.sequences)
-  const addRule = useStore((s) => s.addRule)
-  const updateRule = useStore((s) => s.updateRule)
+function PlaybookForm({ rule, onDone }: { rule?: PlaybookRecord; onDone: () => void }) {
+  const sequencesQuery = useSequences({ pageSize: 100, sort: "name:asc" })
+  const createPlaybook = useCreatePlaybook()
+  const updatePlaybook = useUpdatePlaybook()
+  const sequences = sequencesQuery.data?.data ?? []
+  const saving = createPlaybook.isPending || updatePlaybook.isPending
 
   const [name, setName] = useState(rule?.name ?? "")
   const [description, setDescription] = useState(rule?.description ?? "")
@@ -771,6 +852,7 @@ function PlaybookForm({ rule, onDone }: { rule?: PlaybookRule; onDone: () => voi
   )
   const [sequenceId, setSequenceId] = useState(rule?.sequenceId ?? NO_SEQ)
   const [requireApproval, setRequireApproval] = useState(rule?.requireApproval ?? true)
+  const [serverError, setServerError] = useState<string | null>(null)
   const enabled = rule?.enabled ?? true
 
   const needsSequence = actions.includes("enroll_sequence") && sequenceId === NO_SEQ
@@ -780,6 +862,7 @@ function PlaybookForm({ rule, onDone }: { rule?: PlaybookRule; onDone: () => voi
     tiers.length === 0 && "Select at least one tier.",
     needsSequence && "“Enroll in sequence” requires a sequence.",
   ].filter(Boolean) as string[]
+  const visibleErrors = touched ? errors : errors.filter((e) => !e.startsWith("Name"))
 
   const toggleTier = (t: Tier, on: boolean) =>
     setTiers((cur) => (on ? ALL_TIERS.filter((x) => x === t || cur.includes(x)) : cur.filter((x) => x !== t)))
@@ -789,26 +872,36 @@ function PlaybookForm({ rule, onDone }: { rule?: PlaybookRule; onDone: () => voi
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     setTouched(true)
+    setServerError(null)
     if (errors.length) return
-    const payload = {
+    const payload: PlaybookInput = {
       name: name.trim(),
       description: description.trim(),
       trigger,
       minScore,
       tiers,
       actions: ACTION_KEYS.filter((a) => a === "rescore" || actions.includes(a)),
-      sequenceId: sequenceId === NO_SEQ ? undefined : sequenceId,
       requireApproval,
       enabled,
     }
+    const onError = (err: Error) => setServerError(errorMessage(err))
     if (rule) {
-      updateRule(rule.id, payload)
-      toast.success("Playbook updated", { description: payload.name })
+      updatePlaybook.mutate(
+        { id: rule.id, ...payload, sequenceId: sequenceId === NO_SEQ ? null : sequenceId },
+        {
+          onSuccess: (r) => {
+            toast.success("Playbook updated", { description: r.name })
+            onDone()
+          },
+          onError,
+        },
+      )
     } else {
-      addRule(payload)
-      toast.success("Playbook created", { description: payload.name })
+      createPlaybook.mutate(
+        { ...payload, ...(sequenceId === NO_SEQ ? {} : { sequenceId }) },
+        { onSuccess: () => onDone(), onError },
+      )
     }
-    onDone()
   }
 
   return (
@@ -899,10 +992,14 @@ function PlaybookForm({ rule, onDone }: { rule?: PlaybookRule; onDone: () => voi
             <FieldLabel>Sequence</FieldLabel>
             <Select value={sequenceId} onValueChange={setSequenceId}>
               <SelectTrigger className="w-full" aria-invalid={needsSequence}>
-                <SelectValue />
+                <SelectValue placeholder={sequencesQuery.isLoading ? "Loading sequences…" : undefined} />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value={NO_SEQ}>No sequence</SelectItem>
+                {/* Keep the current selection visible even if it isn't in the loaded page. */}
+                {rule?.sequenceId && rule.sequenceName && !sequences.some((s) => s.id === rule.sequenceId) && (
+                  <SelectItem value={rule.sequenceId}>{rule.sequenceName}</SelectItem>
+                )}
                 {sequences.map((s) => (
                   <SelectItem key={s.id} value={s.id}>
                     {s.name}
@@ -921,18 +1018,20 @@ function PlaybookForm({ rule, onDone }: { rule?: PlaybookRule; onDone: () => voi
           </Field>
         </FieldGroup>
       </div>
-      {errors.length > 0 && (touched || errors.some((e) => !e.startsWith("Name"))) && (
+      {(visibleErrors.length > 0 || serverError) && (
         <ul className="list-inside list-disc text-sm text-destructive">
-          {(touched ? errors : errors.filter((e) => !e.startsWith("Name"))).map((e) => (
+          {visibleErrors.map((e) => (
             <li key={e}>{e}</li>
           ))}
+          {serverError && <li>{serverError}</li>}
         </ul>
       )}
       <DialogFooter>
         <Button type="button" variant="outline" onClick={onDone}>
           Cancel
         </Button>
-        <Button type="submit" disabled={touched && errors.length > 0}>
+        <Button type="submit" disabled={(touched && errors.length > 0) || saving}>
+          {saving && <Loader2Icon className="animate-spin" />}
           {rule ? "Save changes" : "Create playbook"}
         </Button>
       </DialogFooter>

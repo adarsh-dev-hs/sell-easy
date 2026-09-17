@@ -1,40 +1,37 @@
 "use client"
 
-import { useMemo } from "react"
 import { ArrowDownIcon, ArrowUpIcon, LayersIcon } from "lucide-react"
 import { toast } from "sonner"
 import { EmptyState } from "@/components/shared/empty-state"
+import { QueryError } from "@/components/shared/query-state"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Skeleton } from "@/components/ui/skeleton"
+import { isAdmin, useCurrentUser, useSaveWaterfall, useWaterfall } from "@/lib/api"
 import { INTEGRATION_CATEGORY_LABELS } from "@/lib/constants"
-import { useStore } from "@/lib/store"
-import { isWaterfallCandidate, waterfallRank } from "./config"
 import { IntegrationTile } from "./integration-card"
 
 export function WaterfallCard() {
-  const integrations = useStore((s) => s.integrations)
-  const updateIntegrationSettings = useStore((s) => s.updateIntegrationSettings)
+  const user = useCurrentUser()
+  const canEdit = isAdmin(user.role)
+  const waterfall = useWaterfall()
+  const save = useSaveWaterfall()
 
-  // The order is persisted on each integration's settings (`waterfallOrder`), so the
-  // derived list is the single source of truth and survives reloads.
-  const providers = useMemo(
-    () =>
-      integrations
-        .filter(isWaterfallCandidate)
-        .map((i, idx) => ({ i, idx }))
-        .sort((a, b) => waterfallRank(a.i) - waterfallRank(b.i) || a.idx - b.idx)
-        .map((x) => x.i),
-    [integrations],
-  )
+  // The org-level order lives on the server; while a save is in flight show the requested order.
+  const fetched = waterfall.data ?? []
+  const pendingKeys = save.isPending ? save.variables : undefined
+  const providers = pendingKeys
+    ? [...fetched].sort((a, b) => pendingKeys.indexOf(a.key) - pendingKeys.indexOf(b.key))
+    : fetched
 
   const move = (index: number, dir: -1 | 1) => {
     const target = index + dir
-    if (target < 0 || target >= providers.length) return
-    const next = [...providers]
+    if (!canEdit || save.isPending || target < 0 || target >= providers.length) return
+    const next = providers.map((p) => p.key)
     ;[next[index], next[target]] = [next[target], next[index]]
-    next.forEach((p, pos) => updateIntegrationSettings(p.id, { waterfallOrder: String(pos + 1) }))
-    toast.success(`${providers[index].name} moved to position ${target + 1}`)
+    const moved = providers[index].name
+    save.mutate(next, { onSuccess: () => toast.success(`${moved} moved to position ${target + 1}`) })
   }
 
   return (
@@ -48,7 +45,15 @@ export function WaterfallCard() {
         </CardDescription>
       </CardHeader>
       <CardContent>
-        {providers.length === 0 ? (
+        {waterfall.isError ? (
+          <QueryError error={waterfall.error} onRetry={() => waterfall.refetch()} />
+        ) : waterfall.isPending ? (
+          <div className="space-y-2">
+            {[0, 1, 2].map((n) => (
+              <Skeleton key={n} className="h-12 w-full rounded-lg" />
+            ))}
+          </div>
+        ) : providers.length === 0 ? (
           <EmptyState
             icon={LayersIcon}
             title="No waterfall providers"
@@ -57,7 +62,7 @@ export function WaterfallCard() {
         ) : (
           <ol className="space-y-2">
             {providers.map((p, idx) => (
-              <li key={p.id} className="flex items-center gap-3 rounded-lg border p-2">
+              <li key={p.key} className="flex items-center gap-3 rounded-lg border p-2">
                 <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold tabular-nums">
                   {idx + 1}
                 </span>
@@ -72,14 +77,14 @@ export function WaterfallCard() {
                   {INTEGRATION_CATEGORY_LABELS[p.category]}
                 </Badge>
                 <div className="flex gap-1">
-                  <Button size="icon-sm" variant="ghost" aria-label={`Move ${p.name} up`} disabled={idx === 0} onClick={() => move(idx, -1)}>
+                  <Button size="icon-sm" variant="ghost" aria-label={`Move ${p.name} up`} disabled={!canEdit || save.isPending || idx === 0} onClick={() => move(idx, -1)}>
                     <ArrowUpIcon />
                   </Button>
                   <Button
                     size="icon-sm"
                     variant="ghost"
                     aria-label={`Move ${p.name} down`}
-                    disabled={idx === providers.length - 1}
+                    disabled={!canEdit || save.isPending || idx === providers.length - 1}
                     onClick={() => move(idx, 1)}
                   >
                     <ArrowDownIcon />

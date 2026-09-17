@@ -6,56 +6,56 @@ import { ConfigureSheet } from "@/components/integrations/configure-sheet"
 import { ConnectDialog } from "@/components/integrations/connect-dialog"
 import { IntegrationCard } from "@/components/integrations/integration-card"
 import { WaterfallCard } from "@/components/integrations/waterfall-card"
+import { useDebounced } from "@/components/integrations/use-debounced"
 import { EmptyState } from "@/components/shared/empty-state"
 import { PageHeader } from "@/components/shared/page-header"
+import { QueryError } from "@/components/shared/query-state"
 import { StatCard } from "@/components/shared/stat-card"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group"
 import { Label } from "@/components/ui/label"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { useIntegrations, useIntegrationStats } from "@/lib/api"
 import { INTEGRATION_CATEGORY_LABELS } from "@/lib/constants"
 import { number } from "@/lib/format"
-import { useStore } from "@/lib/store"
 import type { IntegrationCategory } from "@/lib/types"
 
 const CATEGORIES = Object.keys(INTEGRATION_CATEGORY_LABELS) as IntegrationCategory[]
 
 export default function IntegrationsPage() {
-  const integrations = useStore((s) => s.integrations)
   const [category, setCategory] = useState<IntegrationCategory | "all">("all")
   const [query, setQuery] = useState("")
   const [connectedOnly, setConnectedOnly] = useState(false)
   const [connectId, setConnectId] = useState<string | null>(null)
   const [configureId, setConfigureId] = useState<string | null>(null)
+  const q = useDebounced(query.trim(), 250)
+
+  // Full catalog for category counts and dialog targets; the grid itself is filtered server-side.
+  const all = useIntegrations()
+  const filtered = useIntegrations({
+    category: category === "all" ? undefined : [category],
+    connected: connectedOnly ? true : undefined,
+    q: q || undefined,
+  })
+  const statsQuery = useIntegrationStats()
+  const integrations = useMemo(() => all.data ?? [], [all.data])
+  const stats = statsQuery.data
 
   const connectTarget = integrations.find((i) => i.id === connectId) ?? null
   const configureTarget = integrations.find((i) => i.id === configureId && i.connected) ?? null
-
-  const stats = useMemo(() => {
-    const connected = integrations.filter((i) => i.connected)
-    const credits = connected.reduce((sum, i) => sum + (i.usage && i.usage.unit === "credits" ? i.usage.used : 0), 0)
-    const tokens = connected.reduce((sum, i) => sum + (i.usage && i.usage.unit !== "credits" ? i.usage.used : 0), 0)
-    return {
-      connected: connected.length,
-      errors: integrations.filter((i) => i.status === "error"),
-      credits,
-      tokens,
-    }
-  }, [integrations])
+  const errored = useMemo(() => {
+    const ids = new Set(stats?.errorIds ?? [])
+    return integrations.filter((i) => ids.has(i.id))
+  }, [integrations, stats?.errorIds])
 
   const groups = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    const filtered = integrations.filter(
-      (i) =>
-        (category === "all" || i.category === category) &&
-        (!connectedOnly || i.connected) &&
-        (!q || `${i.name} ${i.description} ${i.feeds}`.toLowerCase().includes(q)),
-    )
-    return CATEGORIES.map((c) => ({ category: c, items: filtered.filter((i) => i.category === c) })).filter((g) => g.items.length > 0)
-  }, [integrations, category, query, connectedOnly])
+    const items = filtered.data ?? []
+    return CATEGORIES.map((c) => ({ category: c, items: items.filter((i) => i.category === c) })).filter((g) => g.items.length > 0)
+  }, [filtered.data])
 
   const countByCategory = useMemo(() => {
     const m = new Map<string, number>()
@@ -70,16 +70,16 @@ export default function IntegrationsPage() {
         description="Third-party vendors that feed enrichment, signals, outreach and CRM data into SellEasy."
       />
 
-      {stats.errors.length > 0 && (
+      {errored.length > 0 && (
         <Alert variant="destructive">
           <TriangleAlertIcon />
           <AlertTitle>
-            {stats.errors.length} integration{stats.errors.length > 1 ? "s" : ""} need attention
+            {errored.length} integration{errored.length > 1 ? "s" : ""} need attention
           </AlertTitle>
           <AlertDescription>
             <p>Syncs are failing with authentication errors. Reconnect to resume data flow.</p>
             <div className="mt-2 flex flex-wrap gap-2">
-              {stats.errors.map((i) => (
+              {errored.map((i) => (
                 <Button key={i.id} size="sm" variant="outline" onClick={() => setConnectId(i.id)}>
                   <PlugZapIcon /> Reconnect {i.name}
                 </Button>
@@ -89,16 +89,31 @@ export default function IntegrationsPage() {
         </Alert>
       )}
 
-      <div className="grid gap-4 sm:grid-cols-3">
-        <StatCard label="Connected" value={`${stats.connected} / ${integrations.length}`} icon={PlugIcon} hint="vendors feeding SellEasy" />
-        <StatCard
-          label="Errors"
-          value={stats.errors.length}
-          icon={TriangleAlertIcon}
-          hint={stats.errors.length ? stats.errors.map((i) => i.name).join(", ") : "All syncs healthy"}
-        />
-        <StatCard label="Credits used (month)" value={number(stats.credits)} icon={CoinsIcon} hint={`+ ${number(stats.tokens)}k LLM tokens`} />
-      </div>
+      {statsQuery.isError ? (
+        <QueryError error={statsQuery.error} onRetry={() => statsQuery.refetch()} title="Couldn't load integration stats" />
+      ) : !stats ? (
+        <div className="grid gap-4 sm:grid-cols-3">
+          {[0, 1, 2].map((n) => (
+            <Skeleton key={n} className="h-28 rounded-xl" />
+          ))}
+        </div>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-3">
+          <StatCard label="Connected" value={`${stats.connected} / ${stats.total}`} icon={PlugIcon} hint="vendors feeding SellEasy" />
+          <StatCard
+            label="Errors"
+            value={stats.errors}
+            icon={TriangleAlertIcon}
+            hint={stats.errors ? errored.map((i) => i.name).join(", ") || `${stats.errors} failing` : "All syncs healthy"}
+          />
+          <StatCard
+            label="Credits used (month)"
+            value={number(stats.creditsUsed)}
+            icon={CoinsIcon}
+            hint={`+ ${number(stats.tokensUsed)}k LLM tokens`}
+          />
+        </div>
+      )}
 
       <div className="grid gap-6 xl:grid-cols-[1fr_340px]">
         <div className="min-w-0 space-y-6">
@@ -123,7 +138,7 @@ export default function IntegrationsPage() {
               onValueChange={(v) => v && setCategory(v as IntegrationCategory | "all")}
               className="flex-wrap"
             >
-              <ToggleGroupItem value="all">All ({integrations.length})</ToggleGroupItem>
+              <ToggleGroupItem value="all">All ({all.data ? integrations.length : "…"})</ToggleGroupItem>
               {CATEGORIES.map((c) => (
                 <ToggleGroupItem key={c} value={c}>
                   {INTEGRATION_CATEGORY_LABELS[c]} ({countByCategory.get(c) ?? 0})
@@ -132,7 +147,15 @@ export default function IntegrationsPage() {
             </ToggleGroup>
           </div>
 
-          {groups.length === 0 ? (
+          {filtered.isError ? (
+            <QueryError error={filtered.error} onRetry={() => filtered.refetch()} />
+          ) : filtered.isPending ? (
+            <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-3">
+              {Array.from({ length: 6 }).map((_, n) => (
+                <Skeleton key={n} className="h-56 rounded-xl" />
+              ))}
+            </div>
+          ) : groups.length === 0 ? (
             <EmptyState
               icon={PlugIcon}
               title="No integrations match"

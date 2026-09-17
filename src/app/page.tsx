@@ -2,11 +2,11 @@
 
 import { useEffect } from "react"
 import { useRouter } from "next/navigation"
-import { useStore } from "@/lib/store"
+import { useSession } from "@/lib/api"
 
 export default function Home() {
   const router = useRouter()
-  const isAuthenticated = useStore((s) => s.isAuthenticated)
+  const { isAuthenticated } = useSession()
 
   useEffect(() => {
     router.replace(isAuthenticated ? "/dashboard" : "/login")

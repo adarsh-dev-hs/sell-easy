@@ -1,112 +1,43 @@
 "use client"
 
-import { useMemo } from "react"
 import { Bar, BarChart, CartesianGrid, LabelList, XAxis, YAxis } from "recharts"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { QueryError } from "@/components/shared/query-state"
+import { type SequenceRecord, useSequencePerformance } from "@/lib/api"
 import { STEP_CHANNEL_LABELS } from "@/lib/constants"
 import { number, percent } from "@/lib/format"
-import type { Sequence, SequenceStep } from "@/lib/types"
 import { StepChannelIcon, rate } from "./channel"
 
 const funnelChart = {
   value: { label: "Contacts", color: "var(--chart-1)" },
 } satisfies ChartConfig
 
-type StepRow = {
-  step: SequenceStep
-  index: number
-  reached: number
-  primary: number | null // sent / completed
-  primaryLabel: string
-  opened: number | null
-  replied: number | null
-}
+export function SequencePerformance({ sequence }: { sequence: SequenceRecord }) {
+  const perf = useSequencePerformance(sequence.id)
 
-/** Split `total` across `weights` so the parts sum exactly to `total`. */
-function apportion(total: number, weights: number[]) {
-  const sum = weights.reduce((a, b) => a + b, 0)
-  if (!sum || !total) return weights.map(() => 0)
-  const raw = weights.map((w) => (total * w) / sum)
-  const out = raw.map(Math.floor)
-  let rest = total - out.reduce((a, b) => a + b, 0)
-  const order = raw.map((r, i) => ({ i, frac: r - Math.floor(r) })).sort((a, b) => b.frac - a.frac)
-  for (const { i } of order) {
-    if (rest <= 0) break
-    out[i]++
-    rest--
+  if (perf.isError) return <QueryError error={perf.error} onRetry={() => perf.refetch()} title="Couldn't load performance" />
+
+  if (perf.isPending) {
+    return (
+      <div className="space-y-4">
+        <div className="grid gap-4 lg:grid-cols-3">
+          <Skeleton className="h-80 rounded-xl lg:col-span-2" />
+          <Skeleton className="h-80 rounded-xl" />
+        </div>
+        <Skeleton className="h-64 rounded-xl" />
+      </div>
+    )
   }
-  return out
-}
 
-function perStep(sequence: Sequence): StepRow[] {
-  const { stats, steps } = sequence
-  const emailIdx = steps.map((s, i) => (s.channel === "email" ? i : -1)).filter((i) => i >= 0)
-  const sendW = emailIdx.map((_, k) => 0.72 ** k)
-  const sent = apportion(stats.sent, sendW)
-  const opened = apportion(stats.opened, sendW.map((w, k) => w * 0.9 ** k))
-  const replied = apportion(stats.replied, sendW.map((w, k) => w * 0.85 ** k))
-
-  let emailK = 0
-  return steps.map((step, index) => {
-    const reached = Math.round(stats.enrolled * 0.86 ** index)
-    const base = { step, index, reached }
-    switch (step.channel) {
-      case "email": {
-        const k = emailK++
-        return {
-          ...base,
-          primary: sent[k],
-          primaryLabel: "sent",
-          opened: Math.min(opened[k], sent[k]),
-          replied: Math.min(replied[k], sent[k]),
-        }
-      }
-      case "linkedin_connect":
-        return { ...base, primary: Math.round(reached * 0.92), primaryLabel: "requests", opened: Math.round(reached * 0.38), replied: null }
-      case "linkedin_message":
-        return {
-          ...base,
-          primary: Math.round(reached * 0.4),
-          primaryLabel: "messages",
-          opened: Math.round(reached * 0.31),
-          replied: Math.round(reached * 0.06),
-        }
-      case "call":
-        return { ...base, primary: Math.round(reached * 0.7), primaryLabel: "dials", opened: Math.round(reached * 0.18), replied: Math.round(reached * 0.05) }
-      default:
-        return { ...base, primary: null, primaryLabel: "", opened: null, replied: null }
-    }
-  })
-}
-
-const SECONDARY_LABEL: Partial<Record<SequenceStep["channel"], string>> = {
-  email: "opened",
-  linkedin_connect: "accepted",
-  linkedin_message: "seen",
-  call: "connected",
-}
-
-export function SequencePerformance({ sequence }: { sequence: Sequence }) {
-  const { stats } = sequence
-  const funnel = useMemo(
-    () => [
-      { stage: "Enrolled", value: stats.enrolled },
-      { stage: "Sent", value: stats.sent },
-      { stage: "Opened", value: stats.opened },
-      { stage: "Replied", value: stats.replied },
-      { stage: "Meetings", value: stats.meetings },
-    ],
-    [stats],
-  )
-  const rows = useMemo(() => perStep(sequence), [sequence])
-
+  const { stats, funnel, rates, steps } = perf.data
   const conversions = [
-    { label: "Open rate", value: rate(stats.opened, stats.sent), hint: "opened / sent" },
-    { label: "Reply rate", value: rate(stats.replied, stats.sent), hint: "replied / sent" },
-    { label: "Meeting rate", value: rate(stats.meetings, stats.replied), hint: "meetings / replies" },
-    { label: "Bounce rate", value: rate(stats.bounced, stats.sent), hint: "bounced / sent" },
+    { label: "Open rate", value: rates.openRate, hint: "opened / sent" },
+    { label: "Reply rate", value: rates.replyRate, hint: "replied / sent" },
+    { label: "Meeting rate", value: rates.meetingRate, hint: "meetings / replies" },
+    { label: "Bounce rate", value: rates.bounceRate, hint: "bounced / sent" },
   ]
 
   return (
@@ -126,7 +57,7 @@ export function SequencePerformance({ sequence }: { sequence: Sequence }) {
               <ChartContainer config={funnelChart} className="h-64 w-full">
                 <BarChart data={funnel} margin={{ top: 20, left: -12, right: 8 }}>
                   <CartesianGrid vertical={false} />
-                  <XAxis dataKey="stage" tickLine={false} axisLine={false} />
+                  <XAxis dataKey="label" tickLine={false} axisLine={false} />
                   <YAxis tickLine={false} axisLine={false} allowDecimals={false} tickFormatter={(v) => number(Number(v))} />
                   <ChartTooltip cursor={{ fill: "var(--muted)", opacity: 0.5 }} content={<ChartTooltipContent hideIndicator />} />
                   <Bar dataKey="value" fill="var(--color-value)" radius={[4, 4, 0, 0]} maxBarSize={56}>
@@ -176,42 +107,46 @@ export function SequencePerformance({ sequence }: { sequence: Sequence }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {rows.length === 0 && (
+            {steps.length === 0 && (
               <TableRow>
                 <TableCell colSpan={6} className="h-20 text-center text-muted-foreground">
                   No steps in this sequence.
                 </TableCell>
               </TableRow>
             )}
-            {rows.map((r) => (
-              <TableRow key={r.step.id}>
+            {steps.map((r) => (
+              <TableRow key={r.stepId}>
                 <TableCell className="pl-4">
                   <div className="flex items-center gap-3">
-                    <StepChannelIcon channel={r.step.channel} className="size-7" />
+                    <StepChannelIcon channel={r.channel} className="size-7" />
                     <div className="min-w-0">
                       <div className="font-medium">
-                        Step {r.index + 1} · {STEP_CHANNEL_LABELS[r.step.channel]}
+                        Step {r.index + 1} · {STEP_CHANNEL_LABELS[r.channel]}
                       </div>
                       <div className="max-w-64 truncate text-xs text-muted-foreground">
-                        Day {r.step.dayOffset}
-                        {r.step.subject ? ` · ${r.step.subject}` : ""}
+                        Day {r.dayOffset}
+                        {r.subject ? ` · ${r.subject}` : ""}
                       </div>
                     </div>
                   </div>
                 </TableCell>
                 <TableCell className="text-right tabular-nums">{number(r.reached)}</TableCell>
                 <TableCell className="text-right tabular-nums">
-                  {r.primary === null ? "—" : (
+                  {r.primary !== null ? (
                     <>
                       {number(r.primary)} <span className="text-xs text-muted-foreground">{r.primaryLabel}</span>
                     </>
+                  ) : (
+                    "—"
                   )}
                 </TableCell>
                 <TableCell className="text-right tabular-nums">
-                  {r.opened === null ? "—" : (
+                  {r.secondary !== null ? (
                     <>
-                      {number(r.opened)} <span className="text-xs text-muted-foreground">{SECONDARY_LABEL[r.step.channel]}</span>
+                      {number(r.secondary)} <span className="text-xs text-muted-foreground">{r.secondaryLabel}</span>
                     </>
+                  ) : (
+                    "—"
                   )}
                 </TableCell>
                 <TableCell className="text-right tabular-nums">{r.replied === null ? "—" : number(r.replied)}</TableCell>

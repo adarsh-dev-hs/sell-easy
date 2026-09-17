@@ -1,4 +1,8 @@
-// Domain types mirroring the backend service boundaries.
+// API contract: public shapes returned by the SellEasy API.
+// Source of truth: backend/src/domain/types.ts (server-only fields removed here).
+
+/** Every persisted record returned by the API carries these. */
+export type Entity<T extends { id: ID }> = T & { orgId: ID; createdAt: string; updatedAt: string }
 
 export type ID = string
 
@@ -16,6 +20,11 @@ export interface User {
   lastActiveAt?: string
 }
 
+export interface UserPreferences {
+  notifications: Record<string, boolean>
+  channels: Record<string, boolean>
+}
+
 export interface Organization {
   id: ID
   name: string
@@ -23,6 +32,9 @@ export interface Organization {
   plan: "starter" | "growth" | "enterprise"
   seats: number
   timezone: string
+  settings: { autopilot: boolean; waterfallOrder: string[] }
+  createdAt: string
+  updatedAt: string
 }
 
 export interface ApiKey {
@@ -35,6 +47,7 @@ export interface ApiKey {
   createdBy: ID
   revoked: boolean
 }
+
 
 // ---------- Entity service ----------
 export type Tier = "A" | "B" | "C" | "D"
@@ -138,6 +151,8 @@ export interface Signal {
 
 // ---------- ICP / Scoring ----------
 export interface IcpConfig {
+  /** One ICP per org; id === orgId. */
+  id?: ID
   industries: string[]
   countries: string[]
   employeeMin: number
@@ -231,6 +246,17 @@ export interface Sequence {
   steps: SequenceStep[]
   createdAt: string
   stats: { enrolled: number; sent: number; opened: number; replied: number; meetings: number; bounced: number }
+  settings?: SequenceSettings
+}
+
+export interface SequenceSettings {
+  /** 0 = Monday … 6 = Sunday */
+  sendDays: number[]
+  startHour: number
+  endHour: number
+  timezone: string
+  stopOnReply: boolean
+  trackOpens: boolean
 }
 
 export interface Enrollment {
@@ -323,6 +349,8 @@ export type IntegrationCategory =
 
 export interface Integration {
   id: ID
+  /** Stable catalog key, e.g. "hubspot" — unique per org. */
+  key: string
   name: string
   category: IntegrationCategory
   description: string
@@ -344,4 +372,69 @@ export interface AppNotification {
   at: string
   read: boolean
   kind: "signal" | "agent" | "reply" | "deal" | "system"
+}
+
+// ---------------------------------------------------------------------------
+// API envelope & expanded response shapes
+// ---------------------------------------------------------------------------
+
+export interface PageMeta {
+  total: number
+  page: number
+  pageSize: number
+}
+
+export interface Paged<T> {
+  data: T[]
+  meta: PageMeta
+}
+
+export interface AccountRef {
+  id: ID
+  name: string
+  domain: string
+  tier: Tier
+  score: number
+  industry: string
+}
+
+export interface ContactRef {
+  id: ID
+  firstName: string
+  lastName: string
+  title: string
+  email: string
+  accountId: ID
+}
+
+export type WithAccount<T> = T & { account: AccountRef | null }
+export type WithContact<T> = T & { contact: ContactRef | null }
+
+export interface Session {
+  token: string
+  user: User
+  org: Entity<Organization>
+}
+
+export interface RescoreResult {
+  before: number
+  after: number
+  tier: Tier
+}
+
+export interface EnrollResult {
+  enrolled: number
+  skipped: number
+  enrolledIds: ID[]
+  sequence: { id: ID; name: string }
+}
+
+export interface ImportResult {
+  total: number
+  created: number
+  updated: number
+  skipped: number
+  errors: { row: number; message: string }[]
+  dryRun: boolean
+  accountsCreated?: number
 }

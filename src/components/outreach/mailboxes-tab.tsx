@@ -29,12 +29,23 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
 import { EmptyState } from "@/components/shared/empty-state"
+import { QueryError } from "@/components/shared/query-state"
 import { StatCard } from "@/components/shared/stat-card"
 import { StatusBadge } from "@/components/shared/status"
-import { useStore } from "@/lib/store"
+import {
+  canWrite,
+  isAdmin,
+  type MailboxRecord,
+  useAddMailbox,
+  useCurrentUser,
+  useMailboxes,
+  useRemoveMailbox,
+  useUpdateMailbox,
+} from "@/lib/api"
 import type { Mailbox } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -58,17 +69,17 @@ const healthText = (score: number) =>
         ? "text-amber-600 dark:text-amber-400"
         : "text-rose-600 dark:text-rose-400"
 
+// Setup checklist (guidance — DNS verification is not performed by the app yet).
 const AUTH_CHECKS = [
-  { label: "SPF record", detail: "v=spf1 include:amazonses.com include:_spf.google.com ~all" },
-  { label: "DKIM signing", detail: "2048-bit keys published for all sending domains" },
-  { label: "DMARC policy", detail: "p=quarantine; rua reports enabled" },
-  { label: "Custom tracking domain", detail: "track.acmegrowth.com (CNAME verified)" },
-  { label: "Secondary sending domains", detail: "Cold outreach isolated from your primary domain" },
+  { label: "SPF record", detail: "Include every sending provider, e.g. v=spf1 include:amazonses.com ~all" },
+  { label: "DKIM signing", detail: "Publish 2048-bit DKIM keys for each sending domain" },
+  { label: "DMARC policy", detail: "Start with p=none and aggregate (rua) reports, then tighten" },
+  { label: "Custom tracking domain", detail: "CNAME e.g. track.<your-domain> to your email provider" },
+  { label: "Secondary sending domains", detail: "Isolate cold outreach from your primary domain" },
 ]
 
-function ConnectMailboxDialog() {
-  const addMailbox = useStore((s) => s.addMailbox)
-  const mailboxes = useStore((s) => s.mailboxes)
+function ConnectMailboxDialog({ mailboxes }: { mailboxes: MailboxRecord[] }) {
+  const addMailbox = useAddMailbox()
   const [open, setOpen] = useState(false)
   const [email, setEmail] = useState("")
   const [provider, setProvider] = useState<Mailbox["provider"]>("Google")
@@ -79,13 +90,18 @@ function ConnectMailboxDialog() {
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!valid || duplicate) return
-    addMailbox({ email: email.trim(), provider, dailyLimit: Math.max(1, Number(limit) || 40) })
-    toast.success("Mailbox connected", { description: `${email.trim()} is warming up` })
-    setOpen(false)
-    setEmail("")
-    setProvider("Google")
-    setLimit("40")
+    if (!valid || duplicate || addMailbox.isPending) return
+    addMailbox.mutate(
+      { email: email.trim(), provider, dailyLimit: Math.max(1, Math.round(Number(limit)) || 40) },
+      {
+        onSuccess: () => {
+          setOpen(false)
+          setEmail("")
+          setProvider("Google")
+          setLimit("40")
+        },
+      },
+    )
   }
 
   return (
@@ -141,8 +157,8 @@ function ConnectMailboxDialog() {
             <Button type="button" variant="outline" onClick={() => setOpen(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!valid || duplicate}>
-              Connect
+            <Button type="submit" disabled={!valid || duplicate || addMailbox.isPending}>
+              {addMailbox.isPending ? "Connecting…" : "Connect"}
             </Button>
           </DialogFooter>
         </form>
@@ -151,10 +167,18 @@ function ConnectMailboxDialog() {
   )
 }
 
-function MailboxCard({ mailbox: m, onRemove }: { mailbox: Mailbox; onRemove: () => void }) {
-  const updateMailbox = useStore((s) => s.updateMailbox)
-  const sequences = useStore((s) => s.sequences)
-  const usedBy = useMemo(() => sequences.filter((q) => q.mailboxIds.includes(m.id)).length, [sequences, m.id])
+function MailboxCard({
+  mailbox: m,
+  writable,
+  onRemove,
+}: {
+  mailbox: MailboxRecord
+  writable: boolean
+  /** Omitted for non-admins. */
+  onRemove?: () => void
+}) {
+  const updateMailbox = useUpdateMailbox()
+  const usedBy = m.usedBy
   const usage = m.dailyLimit > 0 ? Math.min(100, (m.sentToday / m.dailyLimit) * 100) : 0
 
   const commitLimit = (raw: string) => {
@@ -164,15 +188,19 @@ function MailboxCard({ mailbox: m, onRemove }: { mailbox: Mailbox; onRemove: () 
       return false
     }
     if (n === m.dailyLimit) return true
-    updateMailbox(m.id, { dailyLimit: n })
-    toast.success("Daily limit updated", { description: `${m.email} → ${n}/day` })
+    updateMailbox.mutate(
+      { id: m.id, dailyLimit: n },
+      { onSuccess: () => toast.success("Daily limit updated", { description: `${m.email} → ${n}/day` }) },
+    )
     return true
   }
 
   const togglePause = () => {
     const paused = m.status !== "paused"
-    updateMailbox(m.id, { status: paused ? "paused" : "healthy" })
-    toast.success(paused ? "Mailbox paused" : "Mailbox resumed", { description: m.email })
+    updateMailbox.mutate(
+      { id: m.id, status: paused ? "paused" : "healthy" },
+      { onSuccess: () => toast.success(paused ? "Mailbox paused" : "Mailbox resumed", { description: m.email }) },
+    )
   }
 
   return (
@@ -211,10 +239,13 @@ function MailboxCard({ mailbox: m, onRemove }: { mailbox: Mailbox; onRemove: () 
             Warm-up
             <Switch
               checked={m.warmupEnabled}
-              onCheckedChange={(v) => {
-                updateMailbox(m.id, { warmupEnabled: v })
-                toast.success(v ? "Warm-up enabled" : "Warm-up disabled", { description: m.email })
-              }}
+              disabled={!writable}
+              onCheckedChange={(v) =>
+                updateMailbox.mutate(
+                  { id: m.id, warmupEnabled: v },
+                  { onSuccess: () => toast.success(v ? "Warm-up enabled" : "Warm-up disabled", { description: m.email }) },
+                )
+              }
             />
           </Label>
           <div className="flex items-center justify-between gap-2 rounded-lg border px-3 py-1.5">
@@ -227,6 +258,7 @@ function MailboxCard({ mailbox: m, onRemove }: { mailbox: Mailbox; onRemove: () 
               type="number"
               min={1}
               defaultValue={m.dailyLimit}
+              disabled={!writable}
               className="h-7 w-20 text-right"
               onBlur={(e) => {
                 if (!commitLimit(e.target.value)) e.target.value = String(m.dailyLimit)
@@ -238,23 +270,31 @@ function MailboxCard({ mailbox: m, onRemove }: { mailbox: Mailbox; onRemove: () 
           </div>
         </div>
       </CardContent>
-      <CardFooter className="gap-2">
-        <Button variant="outline" size="sm" onClick={togglePause}>
-          {m.status === "paused" ? <PlayIcon /> : <PauseIcon />}
-          {m.status === "paused" ? "Resume" : "Pause"}
-        </Button>
-        <Button variant="ghost" size="sm" className="ml-auto text-destructive hover:text-destructive" onClick={onRemove}>
-          <Trash2Icon /> Remove
-        </Button>
-      </CardFooter>
+      {writable && (
+        <CardFooter className="gap-2">
+          <Button variant="outline" size="sm" onClick={togglePause} disabled={updateMailbox.isPending}>
+            {m.status === "paused" ? <PlayIcon /> : <PauseIcon />}
+            {m.status === "paused" ? "Resume" : "Pause"}
+          </Button>
+          {onRemove && (
+            <Button variant="ghost" size="sm" className="ml-auto text-destructive hover:text-destructive" onClick={onRemove}>
+              <Trash2Icon /> Remove
+            </Button>
+          )}
+        </CardFooter>
+      )}
     </Card>
   )
 }
 
 export function MailboxesTab() {
-  const mailboxes = useStore((s) => s.mailboxes)
-  const removeMailbox = useStore((s) => s.removeMailbox)
-  const [toRemove, setToRemove] = useState<Mailbox | null>(null)
+  const me = useCurrentUser()
+  const writable = canWrite(me.role)
+  const admin = isAdmin(me.role)
+  const query = useMailboxes()
+  const removeMailbox = useRemoveMailbox()
+  const [toRemove, setToRemove] = useState<MailboxRecord | null>(null)
+  const mailboxes = useMemo(() => query.data ?? [], [query.data])
 
   const summary = useMemo(() => {
     const active = mailboxes.filter((m) => m.status !== "paused")
@@ -275,24 +315,42 @@ export function MailboxesTab() {
   return (
     <div className="space-y-4">
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Mailboxes" value={mailboxes.length} icon={MailIcon} hint={`${summary.warming} warming up`} />
-        <StatCard label="Sent today" value={summary.sent} hint={`of ${summary.capacity} daily capacity`} />
-        <StatCard label="Avg. health" value={`${summary.avgHealth}/100`} icon={ShieldCheckIcon} />
-        <StatCard label="Alerts" value={alerts} icon={TriangleAlertIcon} hint={alerts ? "needs attention" : "all clear"} />
+        {query.isPending ? (
+          Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-[6.5rem] rounded-xl" />)
+        ) : (
+          <>
+            <StatCard label="Mailboxes" value={mailboxes.length} icon={MailIcon} hint={`${summary.warming} warming up`} />
+            <StatCard label="Sent today" value={summary.sent} hint={`of ${summary.capacity} daily capacity`} />
+            <StatCard label="Avg. health" value={`${summary.avgHealth}/100`} icon={ShieldCheckIcon} />
+            <StatCard label="Alerts" value={alerts} icon={TriangleAlertIcon} hint={alerts ? "needs attention" : "all clear"} />
+          </>
+        )}
       </div>
 
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="space-y-4 xl:col-span-2">
           <div className="flex items-center justify-between gap-2">
             <h2 className="text-lg font-semibold">Connected mailboxes</h2>
-            <ConnectMailboxDialog />
+            {admin && <ConnectMailboxDialog mailboxes={mailboxes} />}
           </div>
-          {mailboxes.length === 0 ? (
-            <EmptyState icon={MailIcon} title="No mailboxes" description="Connect a mailbox to start sending sequences." />
+          {query.isError ? (
+            <QueryError error={query.error} onRetry={() => query.refetch()} />
+          ) : query.isPending ? (
+            <div className="grid gap-4 md:grid-cols-2">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <Skeleton key={i} className="h-72 rounded-xl" />
+              ))}
+            </div>
+          ) : mailboxes.length === 0 ? (
+            <EmptyState
+              icon={MailIcon}
+              title="No mailboxes"
+              description={admin ? "Connect a mailbox to start sending sequences." : "Ask an admin to connect a mailbox."}
+            />
           ) : (
             <div className="grid gap-4 md:grid-cols-2">
               {mailboxes.map((m) => (
-                <MailboxCard key={m.id} mailbox={m} onRemove={() => setToRemove(m)} />
+                <MailboxCard key={m.id} mailbox={m} writable={writable} onRemove={admin ? () => setToRemove(m) : undefined} />
               ))}
             </div>
           )}
@@ -305,7 +363,8 @@ export function MailboxesTab() {
               <CardDescription>Live checks across your sending infrastructure</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              {alerts === 0 && (
+              {query.isPending && <Skeleton className="h-16 rounded-lg" />}
+              {query.isSuccess && alerts === 0 && (
                 <Alert>
                   <CircleCheckIcon />
                   <AlertTitle>All mailboxes look healthy</AlertTitle>
@@ -351,13 +410,13 @@ export function MailboxesTab() {
           <Card>
             <CardHeader>
               <CardTitle>Domain authentication</CardTitle>
-              <CardDescription>Verified for all sending domains</CardDescription>
+              <CardDescription>Checklist for every sending domain</CardDescription>
             </CardHeader>
             <CardContent>
               <ul className="space-y-3">
                 {AUTH_CHECKS.map((c) => (
                   <li key={c.label} className="flex gap-3">
-                    <CircleCheckIcon className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    <CircleCheckIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     <div className="min-w-0">
                       <div className="text-sm font-medium">{c.label}</div>
                       <div className="truncate font-mono text-xs text-muted-foreground" title={c.detail}>
@@ -394,8 +453,7 @@ export function MailboxesTab() {
         confirmLabel="Remove mailbox"
         onConfirm={() => {
           if (!toRemove) return
-          removeMailbox(toRemove.id)
-          toast.success("Mailbox removed", { description: toRemove.email })
+          removeMailbox.mutate(toRemove.id)
           setToRemove(null)
         }}
       />

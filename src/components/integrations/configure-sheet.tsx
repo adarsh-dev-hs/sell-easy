@@ -1,9 +1,10 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import { CheckCircle2Icon, KeyRoundIcon, Loader2Icon, UnplugIcon, XCircleIcon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
+import { QueryError } from "@/components/shared/query-state"
 import { StatusBadge } from "@/components/shared/status"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -18,36 +19,25 @@ import {
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Switch } from "@/components/ui/switch"
 import { INTEGRATION_CATEGORY_LABELS } from "@/lib/constants"
 import { dateTime, timeAgo } from "@/lib/format"
-import { useStore } from "@/lib/store"
+import {
+  isAdmin,
+  useConnectIntegration,
+  useCurrentUser,
+  useDisconnectIntegration,
+  useIntegration,
+  useUpdateIntegrationSettings,
+} from "@/lib/api"
 import type { Integration } from "@/lib/types"
 import { CATEGORY_FIELDS, SYNC_INTERVALS, type ConfigField } from "./config"
 import { IntegrationTile, UsageBar } from "./integration-card"
 
 type Settings = Integration["settings"]
-
-const hash = (s: string) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
-
-function buildSyncLog(i: Integration) {
-  if (!i.lastSyncAt) return []
-  const base = new Date(i.lastSyncAt).getTime()
-  const step = SYNC_INTERVALS.find((x) => x.value === i.settings.syncInterval)?.ms ?? 3_600_000
-  const noun = i.category === "llm" ? "requests" : i.category === "crm" ? "records" : i.category === "intent" ? "signals" : "records"
-  return Array.from({ length: 5 }, (_, idx) => {
-    const failed = idx === 0 && i.status === "error"
-    const count = (hash(`${i.id}-${idx}`) % 180) + 12
-    return {
-      at: new Date(base - idx * step).toISOString(),
-      ok: !failed,
-      message: failed ? "401 Unauthorized — API key rejected" : `Synced ${count} ${noun}`,
-      durationMs: 400 + (hash(`${i.id}:${idx}`) % 2600),
-    }
-  })
-}
 
 export function ConfigureSheet({ integration, onOpenChange }: { integration: Integration | null; onOpenChange: (open: boolean) => void }) {
   return (
@@ -60,9 +50,12 @@ export function ConfigureSheet({ integration, onOpenChange }: { integration: Int
 }
 
 function ConfigureBody({ integration: i, onClose }: { integration: Integration; onClose: () => void }) {
-  const updateIntegrationSettings = useStore((s) => s.updateIntegrationSettings)
-  const connectIntegration = useStore((s) => s.connectIntegration)
-  const disconnectIntegration = useStore((s) => s.disconnectIntegration)
+  const user = useCurrentUser()
+  const canManage = isAdmin(user.role)
+  const detail = useIntegration(i.id)
+  const updateSettings = useUpdateIntegrationSettings()
+  const connect = useConnectIntegration()
+  const disconnect = useDisconnectIntegration()
 
   const fields = CATEGORY_FIELDS[i.category]
   const [draft, setDraft] = useState<Settings>(() => {
@@ -75,10 +68,10 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
   })
   const [rotating, setRotating] = useState(false)
   const [newKey, setNewKey] = useState("")
-  const [rotateBusy, setRotateBusy] = useState(false)
+  const rotateBusy = connect.isPending
   const [confirmDisconnect, setConfirmDisconnect] = useState(false)
 
-  const log = useMemo(() => buildSyncLog(i), [i])
+  const log = detail.data?.syncLog ?? []
   const set = (key: string, value: string | boolean) => setDraft((d) => ({ ...d, [key]: value }))
 
   const numberErrors = fields
@@ -98,24 +91,24 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
     }
     const clean: Settings = { ...draft }
     for (const f of fields) if (f.type === "number") clean[f.key] = String(Number(draft[f.key]))
-    updateIntegrationSettings(i.id, clean)
-    toast.success(`${i.name} settings saved`)
+    updateSettings.mutate({ id: i.id, settings: clean })
   }
 
-  const rotate = async () => {
+  const rotate = () => {
     if (newKey.trim().length < 8) {
       toast.error("API key must be at least 8 characters")
       return
     }
-    setRotateBusy(true)
-    try {
-      await connectIntegration(i.id, newKey.trim())
-      toast.success("API key rotated", { description: `${i.name} is using the new key.` })
-      setRotating(false)
-      setNewKey("")
-    } finally {
-      setRotateBusy(false)
-    }
+    connect.mutate(
+      { id: i.id, apiKey: newKey.trim() },
+      {
+        onSuccess: () => {
+          toast.success("API key rotated", { description: `${i.name} is using the new key.` })
+          setRotating(false)
+          setNewKey("")
+        },
+      },
+    )
   }
 
   const renderField = (f: ConfigField) => {
@@ -126,7 +119,7 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
             <FieldLabel htmlFor={`cfg-${f.key}`}>{f.label}</FieldLabel>
             {f.description && <FieldDescription>{f.description}</FieldDescription>}
           </FieldContent>
-          <Switch id={`cfg-${f.key}`} checked={draft[f.key] === true} onCheckedChange={(v) => set(f.key, v)} />
+          <Switch id={`cfg-${f.key}`} checked={draft[f.key] === true} onCheckedChange={(v) => set(f.key, v)} disabled={!canManage} />
         </Field>
       )
     }
@@ -134,7 +127,7 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
       return (
         <Field key={f.key}>
           <FieldLabel htmlFor={`cfg-${f.key}`}>{f.label}</FieldLabel>
-          <Select value={String(draft[f.key])} onValueChange={(v) => set(f.key, v)}>
+          <Select value={String(draft[f.key])} onValueChange={(v) => set(f.key, v)} disabled={!canManage}>
             <SelectTrigger id={`cfg-${f.key}`} className="w-full">
               <SelectValue />
             </SelectTrigger>
@@ -164,6 +157,7 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
           min={f.min}
           value={String(draft[f.key])}
           aria-invalid={!!err}
+          disabled={!canManage}
           onChange={(e) => set(f.key, e.target.value)}
         />
         {err ? <FieldError>{err}</FieldError> : f.description && <FieldDescription>{f.description}</FieldDescription>}
@@ -196,7 +190,7 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
                 <KeyRoundIcon className="size-4 text-muted-foreground" />
                 <code className="truncate font-mono text-sm">{i.apiKeyMasked ?? "—"}</code>
               </div>
-              {!rotating && (
+              {!rotating && canManage && (
                 <Button size="sm" variant="outline" onClick={() => setRotating(true)}>
                   Rotate key
                 </Button>
@@ -243,11 +237,11 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
                   <FieldLabel htmlFor="cfg-autoSync">Auto sync</FieldLabel>
                   <FieldDescription>Pull new data on a schedule.</FieldDescription>
                 </FieldContent>
-                <Switch id="cfg-autoSync" checked={draft.autoSync === true} onCheckedChange={(v) => set("autoSync", v)} />
+                <Switch id="cfg-autoSync" checked={draft.autoSync === true} onCheckedChange={(v) => set("autoSync", v)} disabled={!canManage} />
               </Field>
               <Field data-disabled={draft.autoSync !== true}>
                 <FieldLabel htmlFor="cfg-interval">Sync interval</FieldLabel>
-                <Select value={String(draft.syncInterval)} onValueChange={(v) => set("syncInterval", v)} disabled={draft.autoSync !== true}>
+                <Select value={String(draft.syncInterval)} onValueChange={(v) => set("syncInterval", v)} disabled={!canManage || draft.autoSync !== true}>
                   <SelectTrigger id="cfg-interval" className="w-full">
                     <SelectValue />
                   </SelectTrigger>
@@ -263,11 +257,16 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
               <FieldSeparator>{INTEGRATION_CATEGORY_LABELS[i.category]}</FieldSeparator>
               {fields.map(renderField)}
             </FieldGroup>
-            <div className="flex justify-end gap-2">
-              <Button size="sm" onClick={save} disabled={!dirty || hasErrors}>
-                Save settings
-              </Button>
-            </div>
+            {canManage ? (
+              <div className="flex justify-end gap-2">
+                <Button size="sm" onClick={save} disabled={!dirty || hasErrors || updateSettings.isPending}>
+                  {updateSettings.isPending && <Loader2Icon className="animate-spin" />}
+                  Save settings
+                </Button>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">Only owners and admins can change integration settings.</p>
+            )}
           </section>
 
           {i.usage && (
@@ -287,12 +286,20 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
               <h3 className="text-sm font-medium">Recent syncs</h3>
               <span className="text-xs text-muted-foreground">Last sync {timeAgo(i.lastSyncAt)}</span>
             </div>
-            {log.length === 0 ? (
+            {detail.isError ? (
+              <QueryError error={detail.error} onRetry={() => detail.refetch()} title="Couldn't load sync history" />
+            ) : detail.isPending ? (
+              <div className="space-y-2">
+                {[0, 1, 2].map((n) => (
+                  <Skeleton key={n} className="h-9 w-full" />
+                ))}
+              </div>
+            ) : log.length === 0 ? (
               <p className="text-sm text-muted-foreground">No syncs yet.</p>
             ) : (
               <ul className="divide-y rounded-lg border">
-                {log.map((e) => (
-                  <li key={e.at} className="flex items-center gap-3 px-3 py-2 text-sm">
+                {log.map((e, idx) => (
+                  <li key={`${e.at}-${idx}`} className="flex items-center gap-3 px-3 py-2 text-sm">
                     {e.ok ? (
                       <CheckCircle2Icon className="size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
                     ) : (
@@ -312,9 +319,13 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
       </ScrollArea>
 
       <SheetFooter className="border-t sm:flex-row sm:justify-between">
-        <Button variant="destructive" onClick={() => setConfirmDisconnect(true)}>
-          <UnplugIcon /> Disconnect
-        </Button>
+        {canManage ? (
+          <Button variant="destructive" onClick={() => setConfirmDisconnect(true)} disabled={disconnect.isPending}>
+            {disconnect.isPending ? <Loader2Icon className="animate-spin" /> : <UnplugIcon />} Disconnect
+          </Button>
+        ) : (
+          <span />
+        )}
         <Button variant="outline" onClick={onClose}>
           Close
         </Button>
@@ -326,11 +337,7 @@ function ConfigureBody({ integration: i, onClose }: { integration: Integration; 
         title={`Disconnect ${i.name}?`}
         description={`SellEasy will stop pulling data from ${i.name} and the stored API key will be deleted. ${i.feeds} will no longer receive updates from this provider.`}
         confirmLabel="Disconnect"
-        onConfirm={() => {
-          disconnectIntegration(i.id)
-          toast.success(`${i.name} disconnected`)
-          onClose()
-        }}
+        onConfirm={() => disconnect.mutate(i.id, { onSuccess: onClose })}
       />
     </>
   )

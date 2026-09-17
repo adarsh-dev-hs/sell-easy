@@ -1,8 +1,7 @@
 "use client"
 
-import { useMemo, useState } from "react"
-import { ChevronsUpDownIcon } from "lucide-react"
-import { toast } from "sonner"
+import { useState } from "react"
+import { ChevronsUpDownIcon, Loader2Icon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Command, CommandEmpty, CommandInput, CommandItem, CommandList } from "@/components/ui/command"
 import {
@@ -18,53 +17,86 @@ import { Input } from "@/components/ui/input"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { CompanyAvatar } from "@/components/shared/avatars"
-import { useStore } from "@/lib/store"
+import { useDebounced } from "@/components/accounts/use-debounced"
+import { useAccounts, useCreateContact } from "@/lib/api"
 import type { Seniority } from "@/lib/types"
+import { cn } from "@/lib/utils"
 import { DEPARTMENTS, SENIORITIES } from "./options"
 
-export function AccountPicker({ value, onChange }: { value: string; onChange: (id: string) => void }) {
-  const accounts = useStore((s) => s.accounts)
+export interface AccountOption {
+  id: string
+  name: string
+}
+
+/**
+ * Account combobox that searches accounts server-side.
+ * When `allLabel` is set, an extra option clears the selection (used as a list filter).
+ */
+export function AccountPicker({
+  value,
+  onChange,
+  allLabel,
+  className,
+  placeholder = "Select account…",
+}: {
+  value: AccountOption | null
+  onChange: (account: AccountOption | null) => void
+  allLabel?: string
+  className?: string
+  placeholder?: string
+}) {
   const [open, setOpen] = useState(false)
-  const sorted = useMemo(
-    () => accounts.filter((a) => !a.duplicateOf).sort((a, b) => a.name.localeCompare(b.name)),
-    [accounts],
-  )
-  const selected = accounts.find((a) => a.id === value)
+  const [search, setSearch] = useState("")
+  const q = useDebounced(search.trim())
+  const { data, isFetching } = useAccounts({ q, pageSize: 20, sort: "name:asc" }, open)
+  const rows = data?.data ?? []
+  const pick = (a: AccountOption | null) => {
+    onChange(a)
+    setOpen(false)
+    setSearch("")
+  }
   return (
     <Popover open={open} onOpenChange={setOpen} modal>
       <PopoverTrigger asChild>
-        <Button variant="outline" role="combobox" aria-expanded={open} className="w-full justify-between font-normal">
-          {selected ? (
+        <Button
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          className={cn("w-full justify-between font-normal", allLabel && value && "border-primary/40", className)}
+        >
+          {value ? (
             <span className="flex min-w-0 items-center gap-2">
-              <CompanyAvatar name={selected.name} className="size-5 text-[9px]" />
-              <span className="truncate">{selected.name}</span>
+              <CompanyAvatar name={value.name} className="size-5 text-[9px]" />
+              <span className="truncate">{value.name}</span>
             </span>
           ) : (
-            <span className="text-muted-foreground">Select account…</span>
+            <span className={cn("truncate", !allLabel && "text-muted-foreground")}>{allLabel ?? placeholder}</span>
           )}
           <ChevronsUpDownIcon className="opacity-50" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-(--radix-popover-trigger-width) p-0" align="start">
-        <Command>
-          <CommandInput placeholder="Search accounts…" />
+      <PopoverContent className="w-(--radix-popover-trigger-width) min-w-64 p-0" align="start">
+        <Command shouldFilter={false}>
+          <CommandInput placeholder="Search accounts…" value={search} onValueChange={setSearch} />
           <CommandList>
-            <CommandEmpty>No accounts found.</CommandEmpty>
-            {sorted.map((a) => (
-              <CommandItem
-                key={a.id}
-                value={`${a.name} ${a.domain} ${a.id}`}
-                data-checked={a.id === value}
-                onSelect={() => {
-                  onChange(a.id)
-                  setOpen(false)
-                }}
-              >
+            {!isFetching && <CommandEmpty>No accounts found.</CommandEmpty>}
+            {allLabel && !q && (
+              <CommandItem value="__all" data-checked={!value} onSelect={() => pick(null)}>
+                {allLabel}
+              </CommandItem>
+            )}
+            {rows.map((a) => (
+              <CommandItem key={a.id} value={a.id} data-checked={a.id === value?.id} onSelect={() => pick({ id: a.id, name: a.name })}>
                 <CompanyAvatar name={a.name} className="size-5 text-[9px]" />
                 <span className="truncate">{a.name}</span>
                 <span className="truncate text-xs text-muted-foreground">{a.domain}</span>
               </CommandItem>
             ))}
+            {isFetching && rows.length === 0 && (
+              <div className="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground">
+                <Loader2Icon className="size-4 animate-spin" /> Searching…
+              </div>
+            )}
           </CommandList>
         </Command>
       </PopoverContent>
@@ -102,10 +134,9 @@ function ContactForm({
   onClose: () => void
   onCreated?: (id: string) => void
 }) {
-  const addContact = useStore((s) => s.addContact)
-  const accounts = useStore((s) => s.accounts)
+  const createContact = useCreateContact()
+  const [account, setAccount] = useState<AccountOption | null>(null)
   const [form, setForm] = useState({
-    accountId: fixedAccountId ?? "",
     firstName: "",
     lastName: "",
     title: "",
@@ -116,28 +147,32 @@ function ContactForm({
     linkedinUrl: "",
   })
   const set = <K extends keyof typeof form>(k: K, v: (typeof form)[K]) => setForm((f) => ({ ...f, [k]: v }))
-  const valid = form.accountId && form.firstName.trim() && form.lastName.trim() && form.title.trim()
+  const accountId = fixedAccountId ?? account?.id ?? ""
+  const valid = accountId && form.firstName.trim() && form.lastName.trim() && form.title.trim()
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!valid) return
-    const account = accounts.find((a) => a.id === form.accountId)
-    const id = addContact({
-      accountId: form.accountId,
-      firstName: form.firstName.trim(),
-      lastName: form.lastName.trim(),
-      title: form.title.trim(),
-      seniority: form.seniority,
-      department: form.department,
-      email: form.email.trim(),
-      phone: form.phone.trim() || undefined,
-      linkedinUrl: form.linkedinUrl.trim(),
-      location: account ? [account.city, account.country].filter(Boolean).join(", ") : "",
-      ownerId: account?.ownerId ?? null,
-    })
-    toast.success(`Added ${form.firstName} ${form.lastName}`, { description: account?.name })
-    onCreated?.(id)
-    onClose()
+    if (!valid || createContact.isPending) return
+    // Location and owner are inherited from the account server-side.
+    createContact.mutate(
+      {
+        accountId,
+        firstName: form.firstName.trim(),
+        lastName: form.lastName.trim(),
+        title: form.title.trim(),
+        seniority: form.seniority,
+        department: form.department,
+        email: form.email.trim(),
+        phone: form.phone.trim() || undefined,
+        linkedinUrl: form.linkedinUrl.trim(),
+      },
+      {
+        onSuccess: (c) => {
+          onCreated?.(c.id)
+          onClose()
+        },
+      },
+    )
   }
 
   return (
@@ -150,7 +185,7 @@ function ContactForm({
         {!fixedAccountId && (
           <Field>
             <FieldLabel>Account</FieldLabel>
-            <AccountPicker value={form.accountId} onChange={(v) => set("accountId", v)} />
+            <AccountPicker value={account} onChange={setAccount} />
           </Field>
         )}
         <div className="grid gap-4 sm:grid-cols-2">
@@ -223,7 +258,8 @@ function ContactForm({
         <Button type="button" variant="outline" onClick={onClose}>
           Cancel
         </Button>
-        <Button type="submit" disabled={!valid}>
+        <Button type="submit" disabled={!valid || createContact.isPending}>
+          {createContact.isPending && <Loader2Icon className="animate-spin" />}
           Add contact
         </Button>
       </DialogFooter>

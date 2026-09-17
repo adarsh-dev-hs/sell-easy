@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
@@ -11,6 +11,7 @@ import {
   InboxIcon,
   Loader2Icon,
   MailIcon,
+  SearchIcon,
   SendIcon,
   SparklesIcon,
   WorkflowIcon,
@@ -18,74 +19,78 @@ import {
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group"
 import { Label } from "@/components/ui/label"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { PersonAvatar } from "@/components/shared/avatars"
 import { EmptyState } from "@/components/shared/empty-state"
+import { QueryError } from "@/components/shared/query-state"
 import { StatusBadge } from "@/components/shared/status"
 import { dateTime, fullName, timeAgo } from "@/lib/format"
-import { useCurrentUser, useLookup, useStore } from "@/lib/store"
+import {
+  canWrite,
+  type InboxRecord,
+  useBookMeeting,
+  useCurrentUser,
+  useInbox,
+  useInboxCounts,
+  useInboxMessage,
+  useReplyToMessage,
+  useSuggestReply,
+  useUpdateMessage,
+} from "@/lib/api"
 import type { InboxMessage } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { MessageChannelIcon, SENTIMENT_LABELS } from "./channel"
+import { useDebounced } from "./use-debounced"
 
 type SentimentFilter = "all" | InboxMessage["sentiment"]
 
-const SUGGESTIONS: Record<InboxMessage["sentiment"], (v: { first: string; company: string; sender: string }) => string> = {
-  positive: ({ first, company, sender }) =>
-    `Hi ${first},\n\nGreat to hear from you — thanks for getting back to me. I'd love to walk you through how teams like ${company} are turning intent signals into booked meetings.\n\nDoes Thursday at 2pm or Friday at 10am work? Happy to send an invite for whichever suits.\n\nBest,\n${sender}`,
-  neutral: ({ first, company, sender }) =>
-    `Hi ${first},\n\nThanks for the quick reply — really appreciate it. Would you mind pointing me to the right person on the ${company} revenue team? I'll keep it brief and mention you sent me their way.\n\nThanks again,\n${sender}`,
-  negative: ({ first, sender }) =>
-    `Hi ${first},\n\nUnderstood — I've removed you from our outreach and you won't hear from me again. Apologies for the interruption.\n\nAll the best,\n${sender}`,
-  ooo: ({ first, sender }) =>
-    `Hi ${first},\n\nNo rush at all — enjoy your time away. I'll follow up once you're back next week.\n\nBest,\n${sender}`,
-}
+const contactName = (m: Pick<InboxRecord, "contact"> | null | undefined) => (m?.contact ? fullName(m.contact) : undefined)
 
 export function InboxTab() {
   const router = useRouter()
-  const inbox = useStore((s) => s.inbox)
-  const markMessage = useStore((s) => s.markMessage)
-  const replyToMessage = useStore((s) => s.replyToMessage)
-  const bookMeeting = useStore((s) => s.bookMeeting)
-  const lookup = useLookup()
   const me = useCurrentUser()
+  const writable = canWrite(me.role)
+  const updateMessage = useUpdateMessage()
+  const replyToMessage = useReplyToMessage()
+  const suggestReply = useSuggestReply()
+  const bookMeeting = useBookMeeting()
 
   const [sentiment, setSentiment] = useState<SentimentFilter>("all")
   const [showArchived, setShowArchived] = useState(false)
+  const [query, setQuery] = useState("")
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [suggesting, setSuggesting] = useState(false)
+  const q = useDebounced(query.trim())
 
-  const counts = useMemo(() => {
-    const visible = inbox.filter((m) => showArchived || !m.archived)
-    const c: Record<SentimentFilter, number> = { all: visible.length, positive: 0, neutral: 0, negative: 0, ooo: 0 }
-    for (const m of visible) c[m.sentiment]++
-    return c
-  }, [inbox, showArchived])
+  const countsQuery = useInboxCounts(showArchived)
+  const counts = countsQuery.data
+  const inbox = useInbox({
+    sentiment: sentiment === "all" ? undefined : [sentiment],
+    archived: showArchived || undefined,
+    q: q || undefined,
+    pageSize: 50,
+  })
+  const list = inbox.data?.data ?? []
 
-  const list = useMemo(
-    () =>
-      inbox
-        .filter((m) => (showArchived || !m.archived) && (sentiment === "all" || m.sentiment === sentiment))
-        .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)),
-    [inbox, showArchived, sentiment],
-  )
-
-  const selected = useMemo(() => inbox.find((m) => m.id === selectedId) ?? null, [inbox, selectedId])
-  const contact = lookup.contact(selected?.contactId)
-  const account = lookup.account(contact?.accountId)
-  const sequence = lookup.sequence(selected?.sequenceId)
+  // Prefer the list row (kept fresh by invalidation); fall back to fetching it if it's filtered out.
+  const listed = list.find((m) => m.id === selectedId)
+  const detail = useInboxMessage(selectedId, !listed)
+  const selected = listed ?? (selectedId ? detail.data : undefined) ?? null
+  const contact = selected?.contact ?? null
+  const account = selected?.account ?? null
   const draft = selected ? (drafts[selected.id] ?? "") : ""
 
-  const select = (m: InboxMessage) => {
+  const select = (m: InboxRecord) => {
     setSelectedId(m.id)
-    if (!m.read) markMessage(m.id, { read: true })
+    if (!m.read && writable) updateMessage.mutate({ id: m.id, read: true })
   }
 
   const setDraft = (value: string) => {
@@ -95,53 +100,46 @@ export function InboxTab() {
 
   const suggest = () => {
     if (!selected) return
-    const id = selected.id
-    const text = SUGGESTIONS[selected.sentiment]({
-      first: contact?.firstName ?? "there",
-      company: account?.name ?? "your team",
-      sender: me.name.split(" ")[0],
+    const { id, sentiment: s } = selected
+    suggestReply.mutate(id, {
+      onSuccess: ({ body }) => {
+        setDrafts((d) => ({ ...d, [id]: body }))
+        toast.success("Reply drafted", { description: `Tailored for a ${SENTIMENT_LABELS[s].toLowerCase()} reply` })
+      },
     })
-    setSuggesting(true)
-    setTimeout(() => {
-      setDrafts((d) => ({ ...d, [id]: text }))
-      setSuggesting(false)
-      toast.success("Reply drafted", { description: `Tailored for a ${SENTIMENT_LABELS[selected.sentiment].toLowerCase()} reply` })
-    }, 900)
   }
 
   const send = () => {
-    if (!selected || !draft.trim()) return
-    replyToMessage(selected.id, draft.trim())
-    setDrafts((d) => ({ ...d, [selected.id]: "" }))
-    toast.success("Reply sent", { description: `To ${contact ? fullName(contact) : "contact"}` })
+    if (!selected || !draft.trim() || replyToMessage.isPending) return
+    const id = selected.id
+    replyToMessage.mutate({ id, body: draft.trim() }, { onSuccess: () => setDrafts((d) => ({ ...d, [id]: "" })) })
   }
 
   const book = () => {
     if (!selected) return
-    const dealId = bookMeeting(selected.id)
-    if (!dealId) {
-      toast.error("Could not book meeting", { description: "Contact not found" })
-      return
-    }
-    if (selected.sentiment !== "positive") markMessage(selected.id, { sentiment: "positive" })
-    toast.success("Meeting booked", {
-      description: `${contact ? fullName(contact) : "Contact"} marked as meeting · deal updated`,
-      action: { label: "View deal", onClick: () => router.push(`/pipeline?deal=${dealId}`) },
+    const name = contactName(selected) ?? "Contact"
+    bookMeeting.mutate(selected.id, {
+      onSuccess: ({ deal, created }) =>
+        toast.success("Meeting booked", {
+          description: `${name} marked as meeting · deal ${created ? "created" : "updated"}`,
+          action: { label: "View deal", onClick: () => router.push(`/pipeline?deal=${deal.id}`) },
+        }),
     })
   }
 
   const toggleArchive = () => {
     if (!selected) return
     const archived = !selected.archived
-    markMessage(selected.id, { archived })
-    toast.success(archived ? "Conversation archived" : "Conversation restored")
+    updateMessage.mutate(
+      { id: selected.id, archived },
+      { onSuccess: () => toast.success(archived ? "Conversation archived" : "Conversation restored") },
+    )
     if (archived && !showArchived) setSelectedId(null)
   }
 
   const markUnread = () => {
     if (!selected) return
-    markMessage(selected.id, { read: false })
-    toast.success("Marked as unread")
+    updateMessage.mutate({ id: selected.id, read: false }, { onSuccess: () => toast.success("Marked as unread") })
     setSelectedId(null)
   }
 
@@ -160,30 +158,55 @@ export function InboxTab() {
             {(["all", "positive", "neutral", "negative", "ooo"] as const).map((s) => (
               <ToggleGroupItem key={s} value={s} className="px-3">
                 {s === "all" ? "All" : s === "ooo" ? "OOO" : SENTIMENT_LABELS[s]}
-                <span className="text-xs text-muted-foreground tabular-nums">{counts[s]}</span>
+                {counts && <span className="text-xs text-muted-foreground tabular-nums">{counts[s]}</span>}
               </ToggleGroupItem>
             ))}
           </ToggleGroup>
         </div>
-        <Label className="flex items-center gap-2 font-normal">
-          <Switch checked={showArchived} onCheckedChange={setShowArchived} />
-          Show archived
-        </Label>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <InputGroup className="sm:w-60">
+            <InputGroupAddon>
+              <SearchIcon />
+            </InputGroupAddon>
+            <InputGroupInput placeholder="Search replies…" value={query} onChange={(e) => setQuery(e.target.value)} />
+          </InputGroup>
+          <Label className="flex shrink-0 items-center gap-2 font-normal">
+            <Switch checked={showArchived} onCheckedChange={setShowArchived} />
+            Show archived
+          </Label>
+        </div>
       </div>
 
       <Card className="gap-0 overflow-hidden py-0 lg:grid lg:h-[calc(100svh-17rem)] lg:min-h-[520px] lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
         {/* List */}
         <div className={cn("min-h-0 flex-col lg:flex lg:border-r", selected ? "hidden" : "flex")}>
           <ScrollArea className="h-[60svh] lg:h-full">
-            {list.length === 0 ? (
+            {inbox.isError ? (
+              <div className="p-4">
+                <QueryError error={inbox.error} onRetry={() => inbox.refetch()} />
+              </div>
+            ) : inbox.isPending ? (
+              <ul className="divide-y">
+                {Array.from({ length: 7 }).map((_, i) => (
+                  <li key={i} className="flex gap-3 px-4 py-3">
+                    <Skeleton className="size-8 rounded-full" />
+                    <div className="flex-1 space-y-2">
+                      <Skeleton className="h-4 w-2/3" />
+                      <Skeleton className="h-3.5 w-full" />
+                      <Skeleton className="h-3 w-1/2" />
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : list.length === 0 ? (
               <div className="p-4">
                 <EmptyState icon={InboxIcon} title="No conversations" description="Nothing matches this filter yet." />
               </div>
             ) : (
               <ul className="divide-y">
                 {list.map((m) => {
-                  const c = lookup.contact(m.contactId)
-                  const a = lookup.account(c?.accountId)
+                  const c = m.contact
+                  const a = m.account
                   return (
                     <li key={m.id}>
                       <button
@@ -229,7 +252,15 @@ export function InboxTab() {
         <div className={cn("min-h-0 flex-col lg:flex", selected ? "flex" : "hidden")}>
           {!selected ? (
             <div className="flex h-full items-center justify-center p-6">
-              <EmptyState icon={MailIcon} title="Select a conversation" description="Pick a reply on the left to read the thread and respond." />
+              {selectedId && detail.isPending ? (
+                <Loader2Icon className="size-5 animate-spin text-muted-foreground" />
+              ) : (
+                <EmptyState
+                  icon={MailIcon}
+                  title="Select a conversation"
+                  description="Pick a reply on the left to read the thread and respond."
+                />
+              )}
             </div>
           ) : (
             <>
@@ -259,46 +290,58 @@ export function InboxTab() {
                       )}
                     </div>
                   </div>
-                  <Select
-                    value={selected.sentiment}
-                    onValueChange={(v) => {
-                      markMessage(selected.id, { sentiment: v as InboxMessage["sentiment"] })
-                      toast.success("Sentiment updated", { description: SENTIMENT_LABELS[v as InboxMessage["sentiment"]] })
-                    }}
-                  >
-                    <SelectTrigger size="sm" className="w-36" aria-label="Sentiment">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent align="end">
-                      {(Object.keys(SENTIMENT_LABELS) as InboxMessage["sentiment"][]).map((s) => (
-                        <SelectItem key={s} value={s}>
-                          {SENTIMENT_LABELS[s]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                  {!writable ? (
+                    <StatusBadge status={selected.sentiment} label={SENTIMENT_LABELS[selected.sentiment]} />
+                  ) : (
+                    <Select
+                      value={selected.sentiment}
+                      onValueChange={(v) => {
+                        const next = v as InboxMessage["sentiment"]
+                        updateMessage.mutate(
+                          { id: selected.id, sentiment: next },
+                          { onSuccess: () => toast.success("Sentiment updated", { description: SENTIMENT_LABELS[next] }) },
+                        )
+                      }}
+                    >
+                      <SelectTrigger size="sm" className="w-36" aria-label="Sentiment">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent align="end">
+                        {(Object.keys(SENTIMENT_LABELS) as InboxMessage["sentiment"][]).map((s) => (
+                          <SelectItem key={s} value={s}>
+                            {SENTIMENT_LABELS[s]}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
                 </div>
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
                   <span className="font-medium">{selected.subject}</span>
-                  {sequence && (
-                    <Link href={`/outreach/${sequence.id}`} className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-                      <WorkflowIcon className="size-3.5" /> {sequence.name}
+                  {selected.sequenceId && selected.sequenceName && (
+                    <Link
+                      href={`/outreach/${selected.sequenceId}`}
+                      className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                    >
+                      <WorkflowIcon className="size-3.5" /> {selected.sequenceName}
                     </Link>
                   )}
                   {selected.archived && <StatusBadge status="archived" label="Archived" />}
                 </div>
-                <div className="flex flex-wrap gap-2">
-                  <Button size="sm" onClick={book}>
-                    <CalendarPlusIcon /> Book meeting
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={toggleArchive}>
-                    {selected.archived ? <ArchiveRestoreIcon /> : <ArchiveIcon />}
-                    {selected.archived ? "Unarchive" : "Archive"}
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={markUnread}>
-                    <MailIcon /> Mark unread
-                  </Button>
-                </div>
+                {writable && (
+                  <div className="flex flex-wrap gap-2">
+                    <Button size="sm" onClick={book} disabled={bookMeeting.isPending}>
+                      {bookMeeting.isPending ? <Loader2Icon className="animate-spin" /> : <CalendarPlusIcon />} Book meeting
+                    </Button>
+                    <Button size="sm" variant="outline" onClick={toggleArchive}>
+                      {selected.archived ? <ArchiveRestoreIcon /> : <ArchiveIcon />}
+                      {selected.archived ? "Unarchive" : "Archive"}
+                    </Button>
+                    <Button size="sm" variant="outline" onClick={markUnread}>
+                      <MailIcon /> Mark unread
+                    </Button>
+                  </div>
+                )}
               </div>
 
               <ScrollArea className="h-[45svh] min-h-0 flex-1 lg:h-auto">
@@ -324,30 +367,34 @@ export function InboxTab() {
                 </div>
               </ScrollArea>
 
-              <Separator />
-              <div className="space-y-2 p-4">
-                <Textarea
-                  placeholder={`Reply to ${contact?.firstName ?? "contact"}…`}
-                  className="max-h-48 min-h-24"
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send()
-                  }}
-                />
-                <div className="flex items-center justify-between gap-2">
-                  <Button variant="outline" size="sm" onClick={suggest} disabled={suggesting}>
-                    {suggesting ? <Loader2Icon className="animate-spin" /> : <SparklesIcon />}
-                    {suggesting ? "Drafting…" : "AI suggest"}
-                  </Button>
-                  <div className="flex items-center gap-2">
-                    <span className="hidden text-xs text-muted-foreground sm:inline">⌘ + Enter</span>
-                    <Button size="sm" onClick={send} disabled={!draft.trim()}>
-                      <SendIcon /> Send reply
-                    </Button>
+              {writable && (
+                <>
+                  <Separator />
+                  <div className="space-y-2 p-4">
+                    <Textarea
+                      placeholder={`Reply to ${contact?.firstName ?? "contact"}…`}
+                      className="max-h-48 min-h-24"
+                      value={draft}
+                      onChange={(e) => setDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send()
+                      }}
+                    />
+                    <div className="flex items-center justify-between gap-2">
+                      <Button variant="outline" size="sm" onClick={suggest} disabled={suggestReply.isPending}>
+                        {suggestReply.isPending ? <Loader2Icon className="animate-spin" /> : <SparklesIcon />}
+                        {suggestReply.isPending ? "Drafting…" : "AI suggest"}
+                      </Button>
+                      <div className="flex items-center gap-2">
+                        <span className="hidden text-xs text-muted-foreground sm:inline">⌘ + Enter</span>
+                        <Button size="sm" onClick={send} disabled={!draft.trim() || replyToMessage.isPending}>
+                          {replyToMessage.isPending ? <Loader2Icon className="animate-spin" /> : <SendIcon />} Send reply
+                        </Button>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
+                </>
+              )}
             </>
           )}
         </div>

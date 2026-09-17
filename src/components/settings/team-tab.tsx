@@ -1,12 +1,12 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { CheckIcon, MailIcon, MinusIcon, MoreHorizontalIcon, Trash2Icon, UserPlusIcon } from "lucide-react"
-import { toast } from "sonner"
+import { CheckIcon, Loader2Icon, MailIcon, MinusIcon, MoreHorizontalIcon, PencilIcon, Trash2Icon, UserPlusIcon } from "lucide-react"
 import { UserAvatar } from "@/components/shared/avatars"
 import { ConfirmDialog } from "@/components/shared/confirm-dialog"
+import { QueryError, TableSkeleton } from "@/components/shared/query-state"
 import { StatusBadge } from "@/components/shared/status"
-import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -22,11 +22,21 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/c
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import {
+  ApiError,
+  isAdmin,
+  useCurrentUser,
+  useInviteUser,
+  useOrg,
+  useRemoveUser,
+  useResendInvite,
+  useUpdateUser,
+  useUsers,
+} from "@/lib/api"
 import { ROLE_LABELS } from "@/lib/constants"
 import { timeAgo } from "@/lib/format"
-import { useCurrentUser, useStore } from "@/lib/store"
 import type { Role, User } from "@/lib/types"
-import { canManageOrg, EMAIL_RE } from "./shared"
+import { CopyButton, EMAIL_RE } from "./shared"
 
 const ASSIGNABLE_ROLES: Exclude<Role, "owner">[] = ["admin", "member", "viewer"]
 
@@ -50,27 +60,54 @@ const CAPABILITIES: { label: string; roles: Role[] }[] = [
 
 const ROLES: Role[] = ["owner", "admin", "member", "viewer"]
 
+const inviteUrl = (token: string) => `${window.location.origin}/login?invite=${encodeURIComponent(token)}`
+
+/** Email delivery isn't wired up yet, so admins share the invite link manually. */
+function InviteLink({ email, token }: { email: string; token: string }) {
+  const url = inviteUrl(token)
+  return (
+    <Alert>
+      <MailIcon />
+      <AlertTitle>Share this invite link with {email}</AlertTitle>
+      <AlertDescription className="space-y-2">
+        <p>Email delivery isn&apos;t configured, so send them this link to join. It replaces any earlier link.</p>
+        <div className="flex items-center gap-2">
+          <code className="min-w-0 flex-1 rounded-md border bg-muted/50 px-3 py-1.5 font-mono text-xs break-all select-all">{url}</code>
+          <CopyButton value={url} toastLabel="Invite link copied" />
+        </div>
+      </AlertDescription>
+    </Alert>
+  )
+}
+
 export function TeamTab() {
-  const users = useStore((s) => s.users)
-  const org = useStore((s) => s.org)
-  const updateUser = useStore((s) => s.updateUser)
-  const removeUser = useStore((s) => s.removeUser)
+  const users = useUsers()
+  const org = useOrg()
+  const updateUser = useUpdateUser()
+  const removeUser = useRemoveUser()
+  const resendInvite = useResendInvite()
   const me = useCurrentUser()
-  const canManage = canManageOrg(me?.role)
+  const canManage = isAdmin(me.role)
   const [inviteOpen, setInviteOpen] = useState(false)
   const [removeTarget, setRemoveTarget] = useState<User | null>(null)
+  const [titleTarget, setTitleTarget] = useState<User | null>(null)
+  const [resent, setResent] = useState<{ email: string; token: string } | null>(null)
 
   const sorted = useMemo(
-    () => [...users].sort((a, b) => ROLES.indexOf(a.role) - ROLES.indexOf(b.role) || a.name.localeCompare(b.name)),
-    [users],
+    () => [...(users.data ?? [])].sort((a, b) => ROLES.indexOf(a.role) - ROLES.indexOf(b.role) || a.name.localeCompare(b.name)),
+    [users.data],
   )
-  const seatsFull = users.length >= org.seats
+  const seats = org.data?.seats
+  const seatsUsed = org.data?.seatsUsed
+  const seatsFull = seats !== undefined && seatsUsed !== undefined && seatsUsed >= seats
 
   const changeRole = (u: User, role: Role) => {
-    if (u.role === "owner" || u.id === me?.id) return
-    updateUser(u.id, { role })
-    toast.success(`${u.name}'s role changed to ${ROLE_LABELS[role]}`)
+    if (u.role === "owner" || u.id === me.id || role === "owner") return
+    updateUser.mutate({ id: u.id, role })
   }
+
+  const resend = (u: User) =>
+    resendInvite.mutate(u.id, { onSuccess: (r) => setResent({ email: r.user.email, token: r.inviteToken }) })
 
   return (
     <div className="space-y-6">
@@ -78,7 +115,7 @@ export function TeamTab() {
         <CardHeader>
           <CardTitle>Members</CardTitle>
           <CardDescription>
-            {users.length} of {org.seats} seats used
+            {seats !== undefined ? `${seatsUsed} of ${seats} seats used` : "Loading seats…"}
             {!canManage && " · Only owners and admins can manage members."}
           </CardDescription>
           <CardAction>
@@ -88,6 +125,11 @@ export function TeamTab() {
           </CardAction>
         </CardHeader>
         <CardContent>
+          {users.isError ? (
+            <QueryError error={users.error} onRetry={() => users.refetch()} />
+          ) : users.isPending ? (
+            <TableSkeleton rows={4} className="rounded-lg border" />
+          ) : (
           <div className="overflow-x-auto rounded-lg border">
             <Table>
               <TableHeader>
@@ -104,9 +146,9 @@ export function TeamTab() {
               </TableHeader>
               <TableBody>
                 {sorted.map((u) => {
-                  const isMe = u.id === me?.id
+                  const isMe = u.id === me.id
                   const isOwner = u.role === "owner"
-                  const roleLocked = !canManage || isOwner || isMe
+                  const roleLocked = !canManage || isOwner || isMe || (updateUser.isPending && updateUser.variables?.id === u.id)
                   return (
                     <TableRow key={u.id}>
                       <TableCell>
@@ -158,10 +200,10 @@ export function TeamTab() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            <DropdownMenuItem
-                              disabled={u.status !== "invited"}
-                              onSelect={() => toast.success(`Invitation re-sent to ${u.email}`)}
-                            >
+                            <DropdownMenuItem onSelect={() => setTitleTarget(u)}>
+                              <PencilIcon /> Edit title
+                            </DropdownMenuItem>
+                            <DropdownMenuItem disabled={u.status !== "invited" || resendInvite.isPending} onSelect={() => resend(u)}>
                               <MailIcon /> Resend invite
                             </DropdownMenuItem>
                             <DropdownMenuSeparator />
@@ -177,6 +219,7 @@ export function TeamTab() {
               </TableBody>
             </Table>
           </div>
+          )}
         </CardContent>
       </Card>
 
@@ -229,7 +272,35 @@ export function TeamTab() {
 
       <Dialog open={inviteOpen} onOpenChange={setInviteOpen}>
         <DialogContent className="sm:max-w-md">
-          {inviteOpen && <InviteForm seatsFull={seatsFull} onDone={() => setInviteOpen(false)} />}
+          {inviteOpen && (
+            <InviteForm
+              seatsFull={seatsFull}
+              seats={seats}
+              users={users.data ?? []}
+              orgName={org.data?.name}
+              orgDomain={org.data?.domain}
+              onDone={() => setInviteOpen(false)}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!resent} onOpenChange={(o) => !o && setResent(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Invitation re-sent</DialogTitle>
+            <DialogDescription>A fresh invite link was generated for {resent?.email}.</DialogDescription>
+          </DialogHeader>
+          {resent && <InviteLink email={resent.email} token={resent.token} />}
+          <DialogFooter>
+            <Button onClick={() => setResent(null)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!titleTarget} onOpenChange={(o) => !o && setTitleTarget(null)}>
+        <DialogContent className="sm:max-w-md">
+          {titleTarget && <TitleForm key={titleTarget.id} user={titleTarget} onDone={() => setTitleTarget(null)} />}
         </DialogContent>
       </Dialog>
 
@@ -240,58 +311,120 @@ export function TeamTab() {
         description="They will lose access immediately. Accounts they own will become unassigned."
         confirmLabel={removeTarget?.status === "invited" ? "Revoke invite" : "Remove member"}
         onConfirm={() => {
-          if (!removeTarget) return
-          if (removeTarget.id === me?.id || removeTarget.role === "owner") {
-            toast.error("You can't remove yourself or the workspace owner")
-            return
-          }
-          removeUser(removeTarget.id)
-          toast.success(`${removeTarget.name} removed`)
-          setRemoveTarget(null)
+          if (!removeTarget || removeTarget.id === me.id || removeTarget.role === "owner") return
+          removeUser.mutate(removeTarget.id, { onSuccess: () => setRemoveTarget(null) })
         }}
       />
     </div>
   )
 }
 
-function InviteForm({ seatsFull, onDone }: { seatsFull: boolean; onDone: () => void }) {
-  const users = useStore((s) => s.users)
-  const org = useStore((s) => s.org)
-  const inviteUser = useStore((s) => s.inviteUser)
+function TitleForm({ user, onDone }: { user: User; onDone: () => void }) {
+  const updateUser = useUpdateUser()
+  const [title, setTitle] = useState(user.title ?? "")
+  const error = title.trim().length > 120 ? "Keep the title under 120 characters." : null
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault()
+    if (error) return
+    updateUser.mutate({ id: user.id, title: title.trim() }, { onSuccess: onDone })
+  }
+
+  return (
+    <form onSubmit={submit} className="grid gap-4">
+      <DialogHeader>
+        <DialogTitle>Edit title</DialogTitle>
+        <DialogDescription>Job title shown for {user.name} across SellEasy.</DialogDescription>
+      </DialogHeader>
+      <Field data-invalid={!!error}>
+        <FieldLabel htmlFor="member-title">Job title</FieldLabel>
+        <Input id="member-title" autoFocus value={title} placeholder="e.g. Account Executive" onChange={(e) => setTitle(e.target.value)} />
+        {error && <FieldError>{error}</FieldError>}
+      </Field>
+      <DialogFooter>
+        <Button type="button" variant="outline" onClick={onDone} disabled={updateUser.isPending}>
+          Cancel
+        </Button>
+        <Button type="submit" disabled={updateUser.isPending || title.trim() === (user.title ?? "")}>
+          {updateUser.isPending && <Loader2Icon className="animate-spin" />}
+          Save
+        </Button>
+      </DialogFooter>
+    </form>
+  )
+}
+
+function InviteForm({
+  seatsFull,
+  seats,
+  users,
+  orgName,
+  orgDomain,
+  onDone,
+}: {
+  seatsFull: boolean
+  seats?: number
+  users: User[]
+  orgName?: string
+  orgDomain?: string
+  onDone: () => void
+}) {
+  const inviteUser = useInviteUser()
   const [email, setEmail] = useState("")
   const [role, setRole] = useState<Exclude<Role, "owner">>("member")
   const [submitted, setSubmitted] = useState(false)
+  const [serverError, setServerError] = useState<string | null>(null)
+  const [invited, setInvited] = useState<{ email: string; token: string } | null>(null)
 
   const trimmed = email.trim().toLowerCase()
   const error = !EMAIL_RE.test(trimmed)
     ? "Enter a valid email address."
     : users.some((u) => u.email.toLowerCase() === trimmed)
       ? "This person is already a member or has a pending invite."
-      : null
+      : serverError
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     setSubmitted(true)
-    if (seatsFull) {
-      toast.error("No seats available", { description: "Upgrade your plan to invite more teammates." })
-      return
-    }
-    if (error) return
-    inviteUser(trimmed, role)
-    toast.success(`Invitation sent to ${trimmed}`, { description: `Joining as ${ROLE_LABELS[role]}.` })
-    onDone()
+    if (seatsFull || error) return
+    inviteUser.mutate(
+      { email: trimmed, role },
+      {
+        onSuccess: (r) => setInvited({ email: r.user.email, token: r.inviteToken }),
+        onError: (err) => {
+          if (err instanceof ApiError && (err.status === 409 || err.fieldErrors.email)) setServerError(err.fieldErrors.email?.[0] ?? err.message)
+        },
+      },
+    )
+  }
+
+  if (invited) {
+    return (
+      <div className="grid gap-4">
+        <DialogHeader>
+          <DialogTitle>Invitation created</DialogTitle>
+          <DialogDescription>
+            {invited.email} will join {orgName ?? "your workspace"} as {ROLE_LABELS[role]}.
+          </DialogDescription>
+        </DialogHeader>
+        <InviteLink email={invited.email} token={invited.token} />
+        <DialogFooter>
+          <Button onClick={onDone}>Done</Button>
+        </DialogFooter>
+      </div>
+    )
   }
 
   return (
     <form onSubmit={submit} className="grid gap-4">
       <DialogHeader>
         <DialogTitle>Invite a teammate</DialogTitle>
-        <DialogDescription>They&apos;ll get an email with a link to join {org.name}.</DialogDescription>
+        <DialogDescription>You&apos;ll get a link they can use to join {orgName ?? "your workspace"}.</DialogDescription>
       </DialogHeader>
       {seatsFull && (
         <Alert variant="destructive">
           <AlertDescription>
-            All {org.seats} seats are in use. Upgrade your plan in the Organization tab to invite more people.
+            All {seats} seats are in use. Upgrade your plan in the Organization tab to invite more people.
           </AlertDescription>
         </Alert>
       )}
@@ -302,11 +435,14 @@ function InviteForm({ seatsFull, onDone }: { seatsFull: boolean; onDone: () => v
             id="invite-email"
             type="email"
             autoFocus
-            placeholder={`name@${org.domain}`}
+            placeholder={`name@${orgDomain ?? "company.com"}`}
             value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            onChange={(e) => {
+              setEmail(e.target.value)
+              setServerError(null)
+            }}
             aria-invalid={submitted && !!error}
-            disabled={seatsFull}
+            disabled={seatsFull || inviteUser.isPending}
           />
           {submitted && error && <FieldError>{error}</FieldError>}
         </Field>
@@ -328,11 +464,11 @@ function InviteForm({ seatsFull, onDone }: { seatsFull: boolean; onDone: () => v
         </Field>
       </FieldGroup>
       <DialogFooter>
-        <Button type="button" variant="outline" onClick={onDone}>
+        <Button type="button" variant="outline" onClick={onDone} disabled={inviteUser.isPending}>
           Cancel
         </Button>
-        <Button type="submit" disabled={seatsFull}>
-          <MailIcon /> Send invite
+        <Button type="submit" disabled={seatsFull || inviteUser.isPending}>
+          {inviteUser.isPending ? <Loader2Icon className="animate-spin" /> : <MailIcon />} Send invite
         </Button>
       </DialogFooter>
     </form>

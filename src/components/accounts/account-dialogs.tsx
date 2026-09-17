@@ -2,6 +2,7 @@
 
 import { useState } from "react"
 import { format } from "date-fns"
+import { Loader2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import {
@@ -18,13 +19,16 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea"
 import { COUNTRIES, DEAL_STAGES, FUNDING_STAGES, INDUSTRIES } from "@/lib/constants"
 import { currency } from "@/lib/format"
-import { useStore } from "@/lib/store"
-import type { Account, DealStage } from "@/lib/types"
+import { useCreateAccount, useCreateDeal, useUpdateAccount, useUsers } from "@/lib/api"
+import type { Account, DealStage, User } from "@/lib/types"
 
 const UNASSIGNED = "__none__"
 
+/** Active, non-viewer team members (valid account owners). */
+export const sellersOf = (users: User[] | undefined) => (users ?? []).filter((u) => u.status === "active" && u.role !== "viewer")
+
 function OwnerSelect({ value, onChange }: { value: string | null; onChange: (v: string | null) => void }) {
-  const users = useStore((s) => s.users)
+  const { data: users } = useUsers()
   return (
     <Select value={value ?? UNASSIGNED} onValueChange={(v) => onChange(v === UNASSIGNED ? null : v)}>
       <SelectTrigger className="w-full">
@@ -32,13 +36,11 @@ function OwnerSelect({ value, onChange }: { value: string | null; onChange: (v: 
       </SelectTrigger>
       <SelectContent>
         <SelectItem value={UNASSIGNED}>Unassigned</SelectItem>
-        {users
-          .filter((u) => u.status === "active" && u.role !== "viewer")
-          .map((u) => (
-            <SelectItem key={u.id} value={u.id}>
-              {u.name}
-            </SelectItem>
-          ))}
+        {sellersOf(users).map((u) => (
+          <SelectItem key={u.id} value={u.id}>
+            {u.name}
+          </SelectItem>
+        ))}
       </SelectContent>
     </Select>
   )
@@ -82,7 +84,7 @@ export function AddAccountDialog({
 }
 
 function AddAccountForm({ onClose, onCreated }: { onClose: () => void; onCreated?: (id: string) => void }) {
-  const addAccount = useStore((s) => s.addAccount)
+  const createAccount = useCreateAccount()
   const [form, setForm] = useState({
     name: "",
     domain: "",
@@ -96,29 +98,30 @@ function AddAccountForm({ onClose, onCreated }: { onClose: () => void; onCreated
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!valid) return
-    const id = addAccount({
-      name: form.name.trim(),
-      domain: form.domain.trim(),
-      industry: form.industry,
-      employees: Math.round(Number(form.employees)),
-      country: form.country,
-      ownerId: form.ownerId,
-    })
-    const { accounts } = useStore.getState()
-    const created = accounts.find((a) => a.id === id)
-    const canonical = created?.duplicateOf ? accounts.find((a) => a.id === created.duplicateOf) : undefined
-    if (canonical) {
-      toast.warning(`${form.name} added — possible duplicate`, {
-        description: `Same domain as “${canonical.name}”. Review it in the Duplicates tab.`,
-      })
-    } else {
-      toast.success(`${form.name} added`, {
-        description: created ? `Scored ${created.score} · Tier ${created.tier}` : undefined,
-      })
-    }
-    onCreated?.(id)
-    onClose()
+    if (!valid || createAccount.isPending) return
+    createAccount.mutate(
+      {
+        name: form.name.trim(),
+        domain: form.domain.trim(),
+        industry: form.industry,
+        employees: Math.round(Number(form.employees)),
+        country: form.country,
+        ownerId: form.ownerId,
+      },
+      {
+        onSuccess: ({ account, duplicateOf }) => {
+          if (duplicateOf) {
+            toast.warning(`${account.name} added — possible duplicate`, {
+              description: `Same domain as “${duplicateOf.name}”. Review it in the Duplicates tab.`,
+            })
+          } else {
+            toast.success(`${account.name} added`, { description: `Scored ${account.score} · Tier ${account.tier}` })
+          }
+          onCreated?.(account.id)
+          onClose()
+        },
+      },
+    )
   }
 
   return (
@@ -163,7 +166,8 @@ function AddAccountForm({ onClose, onCreated }: { onClose: () => void; onCreated
         <Button type="button" variant="outline" onClick={onClose}>
           Cancel
         </Button>
-        <Button type="submit" disabled={!valid}>
+        <Button type="submit" disabled={!valid || createAccount.isPending}>
+          {createAccount.isPending && <Loader2Icon className="animate-spin" />}
           Add account
         </Button>
       </DialogFooter>
@@ -202,8 +206,7 @@ const splitList = (s: string) =>
   )
 
 function EditAccountForm({ account, onClose }: { account: Account; onClose: () => void }) {
-  const updateAccount = useStore((s) => s.updateAccount)
-  const rescoreAccount = useStore((s) => s.rescoreAccount)
+  const updateAccount = useUpdateAccount()
   const [form, setForm] = useState({
     name: account.name,
     industry: account.industry,
@@ -225,23 +228,30 @@ function EditAccountForm({ account, onClose }: { account: Account; onClose: () =
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!form.name.trim()) return
-    updateAccount(account.id, {
-      name: form.name.trim(),
-      industry: form.industry,
-      employees: Math.max(1, Math.round(Number(form.employees) || account.employees)),
-      revenue: Math.max(0, Math.round(Number(form.revenue) || 0)),
-      country: form.country,
-      city: form.city.trim(),
-      fundingStage: form.fundingStage,
-      technologies: splitList(form.technologies),
-      tags: splitList(form.tags),
-      description: form.description.trim(),
-    })
-    const { before, after } = rescoreAccount(account.id, "Firmographics edited")
-    toast.success("Account updated", {
-      description: before !== after ? `Score ${before} → ${after}` : "Score unchanged",
-    })
-    onClose()
+    if (updateAccount.isPending) return
+    updateAccount.mutate(
+      {
+        id: account.id,
+        name: form.name.trim(),
+        industry: form.industry,
+        employees: Math.max(1, Math.round(Number(form.employees) || account.employees)),
+        revenue: Math.max(0, Math.round(Number(form.revenue) || 0)),
+        country: form.country,
+        city: form.city.trim(),
+        fundingStage: form.fundingStage,
+        technologies: splitList(form.technologies),
+        tags: splitList(form.tags),
+        description: form.description.trim(),
+      },
+      {
+        onSuccess: ({ rescore }) => {
+          toast.success("Account updated", {
+            description: rescore && rescore.before !== rescore.after ? `Score ${rescore.before} → ${rescore.after}` : "Score unchanged",
+          })
+          onClose()
+        },
+      },
+    )
   }
 
   return (
@@ -305,7 +315,10 @@ function EditAccountForm({ account, onClose }: { account: Account; onClose: () =
         <Button type="button" variant="outline" onClick={onClose}>
           Cancel
         </Button>
-        <Button type="submit">Save changes</Button>
+        <Button type="submit" disabled={updateAccount.isPending}>
+          {updateAccount.isPending && <Loader2Icon className="animate-spin" />}
+          Save changes
+        </Button>
       </DialogFooter>
     </form>
   )
@@ -332,8 +345,7 @@ export function CreateDealDialog({
 }
 
 function DealForm({ account, onClose }: { account: Account; onClose: () => void }) {
-  const addDeal = useStore((s) => s.addDeal)
-  const currentUserId = useStore((s) => s.currentUserId)
+  const createDeal = useCreateDeal()
   const [form, setForm] = useState(() => ({
     name: `${account.name} – New business`,
     amount: String(Math.max(12, Math.round((account.employees * 40) / 1000)) * 1000),
@@ -346,16 +358,23 @@ function DealForm({ account, onClose }: { account: Account; onClose: () => void 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!valid) return
-    addDeal({
-      name: form.name.trim(),
-      accountId: account.id,
-      amount: Math.round(Number(form.amount)),
-      stage: form.stage,
-      closeDate: new Date(`${form.closeDate}T12:00:00`).toISOString(),
-      ownerId: account.ownerId ?? currentUserId,
-    })
-    toast.success("Deal created", { description: `${form.name} · ${currency(Number(form.amount))}` })
-    onClose()
+    if (createDeal.isPending) return
+    // Owner defaults to the account owner (or you) server-side.
+    createDeal.mutate(
+      {
+        name: form.name.trim(),
+        accountId: account.id,
+        amount: Math.round(Number(form.amount)),
+        stage: form.stage,
+        closeDate: new Date(`${form.closeDate}T12:00:00`).toISOString(),
+      },
+      {
+        onSuccess: (d) => {
+          toast.success("Deal created", { description: `${d.name} · ${currency(d.amount)}` })
+          onClose()
+        },
+      },
+    )
   }
 
   return (
@@ -399,7 +418,8 @@ function DealForm({ account, onClose }: { account: Account; onClose: () => void 
         <Button type="button" variant="outline" onClick={onClose}>
           Cancel
         </Button>
-        <Button type="submit" disabled={!valid}>
+        <Button type="submit" disabled={!valid || createDeal.isPending}>
+          {createDeal.isPending && <Loader2Icon className="animate-spin" />}
           Create deal
         </Button>
       </DialogFooter>

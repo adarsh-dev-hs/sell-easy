@@ -1,21 +1,44 @@
 "use client"
 
 import { useEffect } from "react"
-import { useRouter } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
+import { AlertTriangleIcon, Loader2Icon, RotateCwIcon } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { AppHeader } from "@/components/layout/app-header"
 import { AppSidebar } from "@/components/layout/app-sidebar"
-import { useStore } from "@/lib/store"
+import { errorMessage, useMe, useSession } from "@/lib/api"
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
-  const isAuthenticated = useStore((s) => s.isAuthenticated)
+  const pathname = usePathname()
+  const { isAuthenticated, user } = useSession()
+  const me = useMe()
 
   useEffect(() => {
-    if (!isAuthenticated) router.replace("/login")
-  }, [isAuthenticated, router])
+    if (!isAuthenticated) router.replace(`/login?next=${encodeURIComponent(pathname)}`)
+  }, [isAuthenticated, router, pathname])
 
   if (!isAuthenticated) return null
+
+  if (!user) {
+    if (me.isError) {
+      return (
+        <div className="flex min-h-svh flex-col items-center justify-center gap-3 p-6 text-center">
+          <AlertTriangleIcon className="size-6 text-destructive" />
+          <p className="max-w-md text-sm text-muted-foreground">{errorMessage(me.error)}</p>
+          <Button variant="outline" onClick={() => me.refetch()}>
+            <RotateCwIcon /> Retry
+          </Button>
+        </div>
+      )
+    }
+    return (
+      <div className="flex min-h-svh items-center justify-center text-muted-foreground">
+        <Loader2Icon className="size-5 animate-spin" />
+      </div>
+    )
+  }
 
   return (
     <SidebarProvider>

@@ -1,13 +1,14 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { eachWeekOfInterval, format, startOfWeek } from "date-fns"
+import { format, parseISO } from "date-fns"
 import { Bar, BarChart, CartesianGrid, Cell, LabelList, Pie, PieChart, XAxis, YAxis } from "recharts"
 import {
   BotIcon,
   CalendarCheckIcon,
   DollarSignIcon,
   DownloadIcon,
+  Loader2Icon,
   MessageSquareReplyIcon,
   TrophyIcon,
 } from "lucide-react"
@@ -25,29 +26,22 @@ import {
 } from "@/components/ui/chart"
 import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { OwnerLabel } from "@/components/shared/avatars"
 import { PageHeader } from "@/components/shared/page-header"
+import { QueryError } from "@/components/shared/query-state"
 import { TierBadge } from "@/components/shared/score"
 import { StatCard } from "@/components/shared/stat-card"
 import { StatusBadge } from "@/components/shared/status"
-import { downloadCsv, toCsv } from "@/components/analytics/csv"
-import { currentTime, isAgentSourced } from "@/components/pipeline/deal-utils"
-import { DEAL_STAGE_LABEL, SIGNAL_LABELS } from "@/lib/constants"
+import { type AnalyticsOverview, downloadText, errorMessage, fetchDealsCsv, useAnalyticsOverview } from "@/lib/api"
 import { currency, percent } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
-import type { Signal, SignalType, Tier } from "@/lib/types"
 
-const DAY = 86_400_000
 const RANGES = [
   { value: "30", label: "Last 30 days" },
   { value: "90", label: "Last 90 days" },
   { value: "180", label: "Last 180 days" },
 ]
-const TIERS: Tier[] = ["A", "B", "C", "D"]
-const ENGAGED_STAGES = new Set(["engaged", "opportunity", "customer"])
-const ratio = (a: number, b: number) => (b > 0 ? (a / b) * 100 : 0)
-const time = (iso: string) => new Date(iso).getTime()
 
 const createdChart = {
   agent: { label: "Agent-sourced", color: "var(--chart-1)" },
@@ -69,199 +63,26 @@ const tierChart = {
 } satisfies ChartConfig
 
 export default function AnalyticsPage() {
-  const accounts = useStore((s) => s.accounts)
-  const deals = useStore((s) => s.deals)
-  const signals = useStore((s) => s.signals)
-  const sequences = useStore((s) => s.sequences)
-  const users = useStore((s) => s.users)
-  const lookup = useLookup()
-
-  const [nowMs] = useState(currentTime)
   const [range, setRange] = useState("90")
-  const cutoff = nowMs - Number(range) * DAY
+  const days = Number(range)
+  const { data, error, isError, refetch } = useAnalyticsOverview(days)
+  const [exporting, setExporting] = useState(false)
 
-  const scope = useMemo(() => {
-    const realAccounts = accounts.filter((a) => !a.duplicateOf)
-    return {
-      realAccounts,
-      accountsInRange: realAccounts.filter((a) => time(a.createdAt) >= cutoff),
-      dealsInRange: deals.filter((d) => time(d.createdAt) >= cutoff),
-      wonInRange: deals.filter((d) => d.stage === "closed_won" && time(d.closeDate) >= cutoff),
-      signalsInRange: signals.filter((s) => time(s.occurredAt) >= cutoff),
+  const exportCsv = async () => {
+    setExporting(true)
+    try {
+      const csv = await fetchDealsCsv(days)
+      downloadText(csv, `selleasy-deals-${days}d-${format(new Date(), "yyyy-MM-dd")}.csv`)
+      const rows = Math.max(0, csv.trim().split("\n").length - 1)
+      toast.success(`Exported ${rows} deal${rows === 1 ? "" : "s"}`)
+    } catch (err) {
+      toast.error(errorMessage(err))
+    } finally {
+      setExporting(false)
     }
-  }, [accounts, deals, signals, cutoff])
-
-  // ---------- KPIs ----------
-  const kpis = useMemo(() => {
-    const created = scope.dealsInRange.reduce((s, d) => s + d.amount, 0)
-    const agent = scope.dealsInRange.filter((d) => isAgentSourced(d.source)).reduce((s, d) => s + d.amount, 0)
-    const totals = sequences.reduce(
-      (t, q) => ({ sent: t.sent + q.stats.sent, replied: t.replied + q.stats.replied, meetings: t.meetings + q.stats.meetings }),
-      { sent: 0, replied: 0, meetings: 0 },
-    )
-    return {
-      created,
-      createdCount: scope.dealsInRange.length,
-      won: scope.wonInRange.reduce((s, d) => s + d.amount, 0),
-      wonCount: scope.wonInRange.length,
-      replyRate: ratio(totals.replied, totals.sent),
-      replied: totals.replied,
-      meetings: totals.meetings,
-      agentPct: ratio(agent, created),
-      agent,
-    }
-  }, [scope, sequences])
-
-  // ---------- a) Pipeline created by week ----------
-  const weekly = useMemo(() => {
-    const weeks = eachWeekOfInterval({ start: cutoff, end: nowMs })
-    const map = new Map(weeks.map((w) => [w.getTime(), { week: format(w, "MMM d"), agent: 0, sequence: 0, other: 0 }]))
-    for (const d of scope.dealsInRange) {
-      const row = map.get(startOfWeek(new Date(d.createdAt)).getTime())
-      if (!row) continue
-      if (isAgentSourced(d.source)) row.agent += d.amount
-      else if (d.source === "Sequence reply") row.sequence += d.amount
-      else row.other += d.amount
-    }
-    return [...map.values()]
-  }, [scope, cutoff, nowMs])
-
-  // ---------- b) Attribution by signal type ----------
-  const attribution = useMemo(() => {
-    const byAccount = new Map<string, Signal[]>()
-    for (const s of signals) {
-      const list = byAccount.get(s.accountId)
-      if (list) list.push(s)
-      else byAccount.set(s.accountId, [s])
-    }
-    return (Object.keys(SIGNAL_LABELS) as SignalType[])
-      .map((type) => {
-        const touched = scope.dealsInRange.filter((d) =>
-          (byAccount.get(d.accountId) ?? []).some((s) => s.type === type && s.occurredAt < d.createdAt),
-        )
-        return { type: SIGNAL_LABELS[type], amount: touched.reduce((s, d) => s + d.amount, 0), deals: touched.length }
-      })
-      .sort((a, b) => b.amount - a.amount)
-  }, [signals, scope])
-
-  // ---------- c) Funnel ----------
-  const funnel = useMemo(() => {
-    const pool = scope.accountsInRange
-    const withDeal = new Set(deals.map((d) => d.accountId))
-    const withWon = new Set(deals.filter((d) => d.stage === "closed_won").map((d) => d.accountId))
-    const steps = [
-      { step: "Accounts", count: pool.length },
-      { step: "Engaged", count: pool.filter((a) => ENGAGED_STAGES.has(a.stage) || withDeal.has(a.id)).length },
-      { step: "Opportunities", count: pool.filter((a) => withDeal.has(a.id)).length },
-      { step: "Won", count: pool.filter((a) => withWon.has(a.id)).length },
-    ]
-    return steps.map((s, i) => ({
-      ...s,
-      conversion: i === 0 ? 100 : ratio(s.count, steps[i - 1].count),
-      label: i === 0 ? `${s.count}` : `${s.count} · ${percent(ratio(s.count, steps[i - 1].count), 0)}`,
-    }))
-  }, [scope, deals])
-
-  // ---------- d) Tier performance ----------
-  const tiers = useMemo(
-    () =>
-      TIERS.map((tier) => {
-        const ids = new Set(scope.realAccounts.filter((a) => a.tier === tier).map((a) => a.id))
-        const tierDeals = scope.dealsInRange.filter((d) => ids.has(d.accountId))
-        const won = tierDeals.filter((d) => d.stage === "closed_won")
-        const lost = tierDeals.filter((d) => d.stage === "closed_lost")
-        const wonAmount = won.reduce((s, d) => s + d.amount, 0)
-        return {
-          tier,
-          accounts: ids.size,
-          deals: tierDeals.length,
-          winRate: ratio(won.length, won.length + lost.length),
-          closed: won.length + lost.length,
-          avgDeal: won.length ? wonAmount / won.length : 0,
-          pipeline: tierDeals.reduce((s, d) => s + d.amount, 0),
-          won: wonAmount,
-        }
-      }),
-    [scope],
-  )
-
-  // ---------- e) Sequences ----------
-  const sequenceRows = useMemo(
-    () =>
-      [...sequences]
-        .map((q) => ({
-          ...q,
-          openRate: ratio(q.stats.opened, q.stats.sent),
-          replyRate: ratio(q.stats.replied, q.stats.sent),
-          meetingRate: ratio(q.stats.meetings, q.stats.replied),
-        }))
-        .sort((a, b) => b.replyRate - a.replyRate),
-    [sequences],
-  )
-
-  // ---------- f) Reps ----------
-  const reps = useMemo(
-    () =>
-      users
-        .filter((u) => u.role !== "viewer")
-        .map((u) => {
-          const won = scope.wonInRange.filter((d) => d.ownerId === u.id)
-          return {
-            user: u,
-            accounts: scope.realAccounts.filter((a) => a.ownerId === u.id).length,
-            open: deals.filter((d) => d.ownerId === u.id && !d.stage.startsWith("closed")).reduce((s, d) => s + d.amount, 0),
-            wonAmount: won.reduce((s, d) => s + d.amount, 0),
-            wonCount: won.length,
-          }
-        })
-        .sort((a, b) => b.wonAmount - a.wonAmount || b.open - a.open),
-    [users, scope, deals],
-  )
-
-  // ---------- g) Signal source mix ----------
-  const { sourceMix, sourceConfig } = useMemo(() => {
-    const counts = new Map<string, number>()
-    for (const s of scope.signalsInRange) counts.set(s.source, (counts.get(s.source) ?? 0) + 1)
-    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1])
-    const top = sorted.slice(0, 4)
-    const rest = sorted.slice(4).reduce((s, [, n]) => s + n, 0)
-    const entries = rest ? [...top, ["Other", rest] as [string, number]] : top
-    const config: ChartConfig = { value: { label: "Signals" } }
-    const data = entries.map(([name, value], i) => {
-      const key = `src${i}`
-      config[key] = { label: name, color: `var(--chart-${i + 1})` }
-      return { key, name, value, fill: `var(--color-${key})` }
-    })
-    return { sourceMix: data, sourceConfig: config }
-  }, [scope])
-
-  const exportCsv = () => {
-    const rows = scope.dealsInRange.map((d) => [
-      d.id,
-      d.name,
-      lookup.account(d.accountId)?.name ?? "",
-      lookup.account(d.accountId)?.tier ?? "",
-      DEAL_STAGE_LABEL[d.stage],
-      d.amount,
-      d.probability,
-      Math.round((d.amount * d.probability) / 100),
-      d.closeDate.slice(0, 10),
-      lookup.user(d.ownerId)?.name ?? "",
-      d.source,
-      d.crmId ?? "",
-      d.syncedAt ? "yes" : "no",
-      d.createdAt.slice(0, 10),
-      d.updatedAt.slice(0, 10),
-    ])
-    const csv = toCsv(
-      ["Deal ID", "Deal", "Account", "Tier", "Stage", "Amount", "Probability", "Weighted", "Close date", "Owner", "Source", "CRM ID", "Synced", "Created", "Updated"],
-      rows,
-    )
-    downloadCsv(`selleasy-deals-${range}d-${format(nowMs, "yyyy-MM-dd")}.csv`, csv)
-    toast.success(`Exported ${rows.length} deals`)
   }
 
-  const rangeLabel = RANGES.find((r) => r.value === range)?.label.toLowerCase()
+  const rangeLabel = RANGES.find((r) => r.value === range)?.label.toLowerCase() ?? ""
 
   return (
     <>
@@ -282,19 +103,76 @@ export default function AnalyticsPage() {
                 ))}
               </SelectContent>
             </Select>
-            <Button variant="outline" onClick={exportCsv}>
-              <DownloadIcon /> Export CSV
+            <Button variant="outline" onClick={exportCsv} disabled={exporting}>
+              {exporting ? <Loader2Icon className="animate-spin" /> : <DownloadIcon />} Export CSV
             </Button>
           </>
         }
       />
 
+      {data ? (
+        <AnalyticsContent data={data} rangeLabel={rangeLabel} />
+      ) : isError ? (
+        <QueryError error={error} onRetry={() => refetch()} />
+      ) : (
+        <AnalyticsSkeleton />
+      )}
+    </>
+  )
+}
+
+function AnalyticsContent({ data, rangeLabel }: { data: AnalyticsOverview; rangeLabel: string }) {
+  const { stats, attribution, tiers, sequences: sequenceRows, reps } = data
+  const weekly = useMemo(
+    () => data.pipelineByWeek.map((w) => ({ ...w, week: format(parseISO(w.week), "MMM d") })),
+    [data.pipelineByWeek],
+  )
+  const funnel = useMemo(
+    () =>
+      data.funnel.map((s, i) => ({
+        ...s,
+        label: i === 0 ? `${s.count}` : `${s.count} · ${percent(s.conversion, 0)}`,
+      })),
+    [data.funnel],
+  )
+  const { sourceMix, sourceConfig } = useMemo(() => {
+    const config: ChartConfig = { value: { label: "Signals" } }
+    const mix = data.sourceMix.map(({ source, count }, i) => {
+      const key = `src${i}`
+      config[key] = { label: source, color: `var(--chart-${(i % 5) + 1})` }
+      return { key, name: source, value: count, fill: `var(--color-${key})` }
+    })
+    return { sourceMix: mix, sourceConfig: config }
+  }, [data.sourceMix])
+
+  return (
+    <>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
-        <StatCard label="Pipeline created" value={currency(kpis.created)} icon={DollarSignIcon} hint={`${kpis.createdCount} deals, ${rangeLabel}`} />
-        <StatCard label="Revenue won" value={currency(kpis.won)} icon={TrophyIcon} hint={`${kpis.wonCount} deals closed`} />
-        <StatCard label="Reply rate" value={percent(kpis.replyRate)} icon={MessageSquareReplyIcon} hint={`${kpis.replied} replies across sequences`} />
-        <StatCard label="Meetings booked" value={kpis.meetings} icon={CalendarCheckIcon} hint="From outreach sequences" />
-        <StatCard label="Agent-sourced pipeline" value={percent(kpis.agentPct, 0)} icon={BotIcon} hint={`${currency(kpis.agent)} opened by the agent`} />
+        <StatCard
+          label="Pipeline created"
+          value={currency(stats.pipelineCreated)}
+          icon={DollarSignIcon}
+          hint={`${stats.dealsCreated} deals, ${rangeLabel}`}
+        />
+        <StatCard
+          label="Revenue won"
+          value={currency(stats.revenueWon)}
+          icon={TrophyIcon}
+          hint={`${stats.dealsWon} deals closed`}
+        />
+        <StatCard
+          label="Reply rate"
+          value={percent(stats.replyRate)}
+          icon={MessageSquareReplyIcon}
+          hint={`${stats.replies} replies across sequences`}
+        />
+        <StatCard label="Meetings booked" value={stats.meetings} icon={CalendarCheckIcon} hint="From outreach sequences" />
+        <StatCard
+          label="Agent-sourced pipeline"
+          value={percent(stats.agentPct, 0)}
+          icon={BotIcon}
+          hint={`${currency(stats.agentPipeline)} opened by the agent`}
+        />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-5">
@@ -309,11 +187,29 @@ export default function AnalyticsPage() {
                 <CartesianGrid vertical={false} />
                 <XAxis dataKey="week" tickLine={false} axisLine={false} minTickGap={24} />
                 <YAxis tickLine={false} axisLine={false} width={48} tickFormatter={(v) => currency(Number(v))} />
-                <ChartTooltip cursor={{ fillOpacity: 0.4 }} content={<ChartTooltipContent formatter={currencyRow(createdChart)} />} />
+                <ChartTooltip
+                  cursor={{ fillOpacity: 0.4 }}
+                  content={<ChartTooltipContent formatter={currencyRow(createdChart)} />}
+                />
                 <ChartLegend content={<ChartLegendContent />} />
                 <Bar dataKey="other" stackId="a" fill="var(--color-other)" stroke="var(--card)" strokeWidth={1} maxBarSize={36} />
-                <Bar dataKey="sequence" stackId="a" fill="var(--color-sequence)" stroke="var(--card)" strokeWidth={1} maxBarSize={36} />
-                <Bar dataKey="agent" stackId="a" fill="var(--color-agent)" stroke="var(--card)" strokeWidth={1} radius={[4, 4, 0, 0]} maxBarSize={36} />
+                <Bar
+                  dataKey="sequence"
+                  stackId="a"
+                  fill="var(--color-sequence)"
+                  stroke="var(--card)"
+                  strokeWidth={1}
+                  maxBarSize={36}
+                />
+                <Bar
+                  dataKey="agent"
+                  stackId="a"
+                  fill="var(--color-agent)"
+                  stroke="var(--card)"
+                  strokeWidth={1}
+                  radius={[4, 4, 0, 0]}
+                  maxBarSize={36}
+                />
               </BarChart>
             </ChartContainer>
           </CardContent>
@@ -329,7 +225,7 @@ export default function AnalyticsPage() {
               <BarChart data={attribution} layout="vertical" margin={{ left: 0, right: 48 }}>
                 <CartesianGrid horizontal={false} />
                 <XAxis type="number" hide />
-                <YAxis dataKey="type" type="category" tickLine={false} axisLine={false} width={116} />
+                <YAxis dataKey="label" type="category" tickLine={false} axisLine={false} width={116} />
                 <ChartTooltip
                   cursor={{ fillOpacity: 0.4 }}
                   content={
@@ -519,7 +415,10 @@ export default function AnalyticsPage() {
                   <TableRow key={r.user.id}>
                     <TableCell>
                       {i === 0 && r.wonAmount > 0 ? (
-                        <Badge variant="outline" className="border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-400">
+                        <Badge
+                          variant="outline"
+                          className="border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-400"
+                        >
                           1
                         </Badge>
                       ) : (
@@ -529,10 +428,10 @@ export default function AnalyticsPage() {
                     <TableCell>
                       <OwnerLabel user={r.user} />
                     </TableCell>
-                    <TableCell className="text-right tabular-nums">{r.accounts}</TableCell>
-                    <TableCell className="text-right tabular-nums">{currency(r.open)}</TableCell>
+                    <TableCell className="text-right tabular-nums">{r.accountsOwned}</TableCell>
+                    <TableCell className="text-right tabular-nums">{currency(r.openPipeline)}</TableCell>
                     <TableCell className="text-right font-medium tabular-nums">{currency(r.wonAmount)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{r.wonCount}</TableCell>
+                    <TableCell className="text-right tabular-nums">{r.dealsWon}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -544,7 +443,7 @@ export default function AnalyticsPage() {
           <CardHeader>
             <CardTitle>Signal source mix</CardTitle>
             <CardDescription>
-              {scope.signalsInRange.length} signals ingested {rangeLabel}
+              {stats.signals} signals ingested {rangeLabel}
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -574,6 +473,26 @@ export default function AnalyticsPage() {
             )}
           </CardContent>
         </Card>
+      </div>
+    </>
+  )
+}
+
+function AnalyticsSkeleton() {
+  return (
+    <>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <Skeleton key={i} className="h-[106px] rounded-xl" />
+        ))}
+      </div>
+      <div className="grid gap-4 lg:grid-cols-5">
+        <Skeleton className="h-96 rounded-xl lg:col-span-3" />
+        <Skeleton className="h-96 rounded-xl lg:col-span-2" />
+      </div>
+      <div className="grid gap-4 lg:grid-cols-5">
+        <Skeleton className="h-96 rounded-xl lg:col-span-2" />
+        <Skeleton className="h-96 rounded-xl lg:col-span-3" />
       </div>
     </>
   )

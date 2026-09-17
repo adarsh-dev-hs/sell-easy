@@ -1,10 +1,11 @@
 "use client"
 
+import { useState } from "react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
+import { useQueryClient } from "@tanstack/react-query"
 import { ChevronsUpDownIcon, LogOutIcon, MoonIcon, RotateCcwIcon, SunIcon, UserIcon, ZapIcon } from "lucide-react"
 import { useTheme } from "next-themes"
-import { toast } from "sonner"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -28,27 +29,40 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar"
 import { UserAvatar } from "@/components/shared/avatars"
+import { ConfirmDialog } from "@/components/shared/confirm-dialog"
+import { api, useAgentStats, useAuthStore, useCurrentUser, useInboxCounts, useMeta, useResetWorkspace, useSession, useSignalStats } from "@/lib/api"
 import { ROLE_LABELS } from "@/lib/constants"
-import { useCurrentUser, useStore } from "@/lib/store"
 import { NAV_GROUPS } from "./nav"
 
 export function AppSidebar() {
   const pathname = usePathname()
   const router = useRouter()
+  const qc = useQueryClient()
   const { resolvedTheme, setTheme } = useTheme()
   const user = useCurrentUser()
-  const org = useStore((s) => s.org)
-  const logout = useStore((s) => s.logout)
-  const resetDemo = useStore((s) => s.resetDemo)
-  const pendingDrafts = useStore((s) => s.drafts.filter((d) => d.status === "pending").length)
-  const unreadReplies = useStore((s) => s.inbox.filter((m) => !m.read && !m.archived).length)
-  const unprocessed = useStore((s) => s.signals.filter((x) => !x.processed).length)
+  const { org } = useSession()
+  const clear = useAuthStore((s) => s.clear)
+  const meta = useMeta()
+  const agentStats = useAgentStats()
+  const inbox = useInboxCounts()
+  const signalStats = useSignalStats()
+  const reset = useResetWorkspace()
+  const [resetOpen, setResetOpen] = useState(false)
 
   const badges: Record<string, number> = {
-    "/agent": pendingDrafts,
-    "/outreach": unreadReplies,
-    "/signals": unprocessed,
+    "/agent": agentStats.data?.awaitingApproval ?? 0,
+    "/outreach": inbox.data?.unread ?? 0,
+    "/signals": signalStats.data?.unprocessed ?? 0,
   }
+
+  const logout = () => {
+    void api.post("/auth/logout").catch(() => undefined)
+    clear()
+    qc.clear()
+    router.replace("/login")
+  }
+
+  const canReset = user.role === "owner" && meta.data?.features.adminReset
 
   return (
     <Sidebar collapsible="icon">
@@ -62,7 +76,7 @@ export function AppSidebar() {
                 </div>
                 <div className="grid flex-1 text-left text-sm leading-tight">
                   <span className="truncate font-semibold">SellEasy</span>
-                  <span className="truncate text-xs text-muted-foreground">{org.name}</span>
+                  <span className="truncate text-xs text-muted-foreground">{org?.name}</span>
                 </div>
               </Link>
             </SidebarMenuButton>
@@ -113,7 +127,7 @@ export function AppSidebar() {
                 <DropdownMenuLabel className="font-normal">
                   <div className="text-sm font-medium">{user.name}</div>
                   <div className="text-xs text-muted-foreground">
-                    {ROLE_LABELS[user.role]} · {org.name}
+                    {ROLE_LABELS[user.role]} · {org?.name}
                   </div>
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
@@ -124,22 +138,13 @@ export function AppSidebar() {
                   {resolvedTheme === "dark" ? <SunIcon /> : <MoonIcon />}
                   {resolvedTheme === "dark" ? "Light mode" : "Dark mode"}
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  onSelect={() => {
-                    resetDemo()
-                    toast.success("Demo data reset")
-                  }}
-                >
-                  <RotateCcwIcon /> Reset demo data
-                </DropdownMenuItem>
+                {canReset && (
+                  <DropdownMenuItem onSelect={() => setResetOpen(true)}>
+                    <RotateCcwIcon /> Load demo data
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  variant="destructive"
-                  onSelect={() => {
-                    logout()
-                    router.replace("/login")
-                  }}
-                >
+                <DropdownMenuItem variant="destructive" onSelect={logout}>
                   <LogOutIcon /> Log out
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -148,6 +153,14 @@ export function AppSidebar() {
         </SidebarMenu>
       </SidebarFooter>
       <SidebarRail />
+      <ConfirmDialog
+        open={resetOpen}
+        onOpenChange={setResetOpen}
+        title="Replace workspace data with the demo dataset?"
+        description="All accounts, contacts, signals, deals and sequences in this workspace are deleted and replaced with sample data. Users and API keys are kept. (Development only.)"
+        confirmLabel="Load demo data"
+        onConfirm={() => reset.mutate({ demo: true })}
+      />
     </Sidebar>
   )
 }

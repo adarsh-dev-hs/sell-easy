@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import { ArrowDownIcon, ArrowUpIcon, BracesIcon, EyeIcon, PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
@@ -18,10 +18,21 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator"
 import { Textarea } from "@/components/ui/textarea"
 import { EmptyState } from "@/components/shared/empty-state"
+import {
+  type SequenceRecord,
+  useAccount,
+  useAccounts,
+  useAddStep,
+  useEnrollable,
+  useMoveStep,
+  useRemoveStep,
+  useSequenceEnrollments,
+  useUpdateStep,
+  useUsers,
+} from "@/lib/api"
 import { STEP_CHANNEL_LABELS } from "@/lib/constants"
 import { fullName } from "@/lib/format"
-import { useLookup, useStore } from "@/lib/store"
-import type { Sequence, SequenceStep, StepChannel } from "@/lib/types"
+import type { SequenceStep, StepChannel } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { STEP_CHANNEL_DESCRIPTIONS, STEP_CHANNEL_ICONS, StepChannelIcon, VARIABLES, fillTemplate } from "./channel"
 
@@ -34,6 +45,7 @@ function StepCard({
   total,
   selected,
   draft,
+  readOnly,
   onSelect,
   onDraft,
 }: {
@@ -43,12 +55,14 @@ function StepCard({
   total: number
   selected: boolean
   draft?: Draft
+  readOnly: boolean
   onSelect: () => void
-  onDraft: (d: Draft | undefined) => void
+  /** `undefined` clears the draft; pass `onlyIf` to clear only when the draft hasn't changed since. */
+  onDraft: (d: Draft | undefined, onlyIf?: Draft) => void
 }) {
-  const updateStep = useStore((s) => s.updateStep)
-  const removeStep = useStore((s) => s.removeStep)
-  const moveStep = useStore((s) => s.moveStep)
+  const updateStep = useUpdateStep()
+  const removeStep = useRemoveStep()
+  const moveStep = useMoveStep()
 
   const subject = draft?.subject ?? step.subject ?? ""
   const body = draft?.body ?? step.body ?? ""
@@ -58,11 +72,21 @@ function StepCard({
     const patch: Partial<SequenceStep> = {}
     if (draft.subject !== undefined && draft.subject !== (step.subject ?? "")) patch.subject = draft.subject
     if (draft.body !== undefined && draft.body !== (step.body ?? "")) patch.body = draft.body
-    onDraft(undefined)
-    if (Object.keys(patch).length) {
-      updateStep(sequenceId, step.id, patch)
-      toast.success("Step saved", { description: `Step ${index + 1} · ${STEP_CHANNEL_LABELS[step.channel]}` })
+    if (!Object.keys(patch).length) {
+      onDraft(undefined, draft)
+      return
     }
+    // Keep the local text until the refetched step arrives (and only drop it if the user hasn't kept typing).
+    const committed = draft
+    updateStep.mutate(
+      { sequenceId, stepId: step.id, ...patch },
+      {
+        onSuccess: () => {
+          onDraft(undefined, committed)
+          toast.success("Step saved", { description: `Step ${index + 1} · ${STEP_CHANNEL_LABELS[step.channel]}` })
+        },
+      },
+    )
   }
 
   const commitDay = (raw: string, input: HTMLInputElement) => {
@@ -73,8 +97,15 @@ function StepCard({
       return
     }
     if (n !== step.dayOffset) {
-      updateStep(sequenceId, step.id, { dayOffset: n })
-      toast.success(`Step ${index + 1} moved to day ${n}`)
+      updateStep.mutate(
+        { sequenceId, stepId: step.id, dayOffset: n },
+        {
+          onSuccess: () => toast.success(`Step ${index + 1} moved to day ${n}`),
+          onError: () => {
+            input.value = String(step.dayOffset)
+          },
+        },
+      )
     }
   }
 
@@ -109,40 +140,53 @@ function StepCard({
             type="number"
             min={0}
             defaultValue={step.dayOffset}
+            disabled={readOnly}
             className="h-7 w-16"
             onBlur={(e) => commitDay(e.target.value, e.target)}
             onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
           />
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Move up"
-            disabled={index === 0}
-            onClick={() => moveStep(sequenceId, step.id, -1)}
-          >
-            <ArrowUpIcon />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Move down"
-            disabled={index === total - 1}
-            onClick={() => moveStep(sequenceId, step.id, 1)}
-          >
-            <ArrowDownIcon />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Delete step"
-            className="text-muted-foreground hover:text-destructive"
-            onClick={() => {
-              removeStep(sequenceId, step.id)
-              toast.success("Step removed", { description: `${STEP_CHANNEL_LABELS[step.channel]} on day ${step.dayOffset}` })
-            }}
-          >
-            <Trash2Icon />
-          </Button>
+          {!readOnly && (
+            <>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Move up"
+                disabled={index === 0 || moveStep.isPending}
+                onClick={() => moveStep.mutate({ sequenceId, stepId: step.id, direction: "up" })}
+              >
+                <ArrowUpIcon />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Move down"
+                disabled={index === total - 1 || moveStep.isPending}
+                onClick={() => moveStep.mutate({ sequenceId, stepId: step.id, direction: "down" })}
+              >
+                <ArrowDownIcon />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Delete step"
+                className="text-muted-foreground hover:text-destructive"
+                disabled={removeStep.isPending}
+                onClick={() =>
+                  removeStep.mutate(
+                    { sequenceId, stepId: step.id },
+                    {
+                      onSuccess: () =>
+                        toast.success("Step removed", {
+                          description: `${STEP_CHANNEL_LABELS[step.channel]} on day ${step.dayOffset}`,
+                        }),
+                    },
+                  )
+                }
+              >
+                <Trash2Icon />
+              </Button>
+            </>
+          )}
         </div>
       </CardHeader>
       {hasBody && (
@@ -152,6 +196,7 @@ function StepCard({
               aria-label="Subject"
               placeholder="Subject line"
               value={subject}
+              readOnly={readOnly}
               onFocus={onSelect}
               onChange={(e) => onDraft({ ...draft, subject: e.target.value })}
               onBlur={commit}
@@ -162,6 +207,7 @@ function StepCard({
             placeholder={step.channel === "email" ? "Write your email… use {{first_name}} to personalize" : "LinkedIn message…"}
             className="min-h-28"
             value={body}
+            readOnly={readOnly}
             onFocus={step.channel === "email" ? onSelect : undefined}
             onChange={(e) => onDraft({ ...draft, body: e.target.value })}
             onBlur={commit}
@@ -172,12 +218,21 @@ function StepCard({
   )
 }
 
-export function SequenceSteps({ sequence }: { sequence: Sequence }) {
-  const addStep = useStore((s) => s.addStep)
-  const enrollments = useStore((s) => s.enrollments)
-  const contacts = useStore((s) => s.contacts)
-  const accounts = useStore((s) => s.accounts)
-  const lookup = useLookup()
+const PREVIEW_ENROLLMENTS = { pageSize: 50 } as const
+
+type SampleContact = {
+  id: string
+  firstName: string
+  lastName: string
+  title: string
+  email: string
+  accountId?: string
+  accountName?: string | null
+}
+
+export function SequenceSteps({ sequence, readOnly = false }: { sequence: SequenceRecord; readOnly?: boolean }) {
+  const addStep = useAddStep()
+  const { data: users } = useUsers()
 
   const [drafts, setDrafts] = useState<Record<string, Draft>>({})
   const [previewStepId, setPreviewStepId] = useState<string | null>(null)
@@ -186,41 +241,41 @@ export function SequenceSteps({ sequence }: { sequence: Sequence }) {
   const emailSteps = sequence.steps.filter((s) => s.channel === "email")
   const previewStep = emailSteps.find((s) => s.id === previewStepId) ?? emailSteps[0]
 
-  const sampleContacts = useMemo(() => {
-    const ids = new Set(enrollments.filter((e) => e.sequenceId === sequence.id).map((e) => e.contactId))
-    const enrolled = contacts.filter((c) => ids.has(c.id))
-    return (enrolled.length ? enrolled : contacts).slice(0, 50)
-  }, [enrollments, contacts, sequence.id])
+  // Preview as an enrolled contact, falling back to contacts that could be enrolled.
+  const enrolled = useSequenceEnrollments(sequence.id, PREVIEW_ENROLLMENTS)
+  const noneEnrolled = enrolled.isSuccess && enrolled.data.data.length === 0
+  const enrollable = useEnrollable(sequence.id, "", !!previewStep && noneEnrolled)
+  const sampleContacts: SampleContact[] = noneEnrolled
+    ? (enrollable.data?.items ?? []).slice(0, 50)
+    : (enrolled.data?.data ?? []).flatMap((e) =>
+        e.contact ? [{ ...e.contact, accountId: e.account?.id, accountName: e.account?.name }] : [],
+      )
 
   const sample = sampleContacts.find((c) => c.id === previewContactId) ?? sampleContacts[0]
-  const sampleAccount = lookup.account(sample?.accountId)
-  const owner = lookup.user(sequence.ownerId)
-  const similarCustomer = useMemo(
-    () => accounts.find((a) => a.stage === "customer" && a.id !== sample?.accountId && a.industry === sampleAccount?.industry)?.name ??
-      accounts.find((a) => a.stage === "customer" && a.id !== sample?.accountId)?.name ??
-      "Northwind",
-    [accounts, sample?.accountId, sampleAccount?.industry],
-  )
+  const { data: sampleAccount } = useAccount(previewStep ? sample?.accountId : undefined)
+  const { data: customers } = useAccounts({ stage: ["customer"], pageSize: 25 }, !!previewStep)
+  const others = (customers?.data ?? []).filter((a) => a.id !== sample?.accountId)
+  const similarCustomer = (others.find((a) => a.industry === sampleAccount?.industry) ?? others[0])?.name ?? "Northwind"
+  const ownerName = users?.find((u) => u.id === sequence.ownerId)?.name ?? sequence.ownerName ?? undefined
 
   const vars = {
     first_name: sample?.firstName ?? "Alex",
     last_name: sample?.lastName ?? "Doe",
-    company: sampleAccount?.name ?? "Acme",
+    company: sampleAccount?.name ?? sample?.accountName ?? "Acme",
     title: sample?.title ?? "",
-    sender_name: owner?.name.split(" ")[0] ?? "Jordan",
+    sender_name: ownerName?.split(" ")[0] ?? "Your name",
     similar_customer: similarCustomer,
     funding_round: sampleAccount?.fundingStage ?? "Series B",
   }
 
   const add = (channel: StepChannel) => {
-    const last = sequence.steps.reduce((m, s) => Math.max(m, s.dayOffset), -2)
-    const dayOffset = sequence.steps.length ? last + 2 : 0
-    addStep(sequence.id, {
-      channel,
-      dayOffset,
-      ...(channel === "email" ? { subject: "", body: "" } : channel === "linkedin_message" ? { body: "" } : {}),
-    })
-    toast.success(`${STEP_CHANNEL_LABELS[channel]} step added`, { description: `Day ${dayOffset}` })
+    addStep.mutate(
+      { sequenceId: sequence.id, channel },
+      {
+        onSuccess: (step) =>
+          toast.success(`${STEP_CHANNEL_LABELS[channel]} step added`, { description: `Day ${step.dayOffset}` }),
+      },
+    )
   }
 
   const copyVar = async (v: string) => {
@@ -232,8 +287,9 @@ export function SequenceSteps({ sequence }: { sequence: Sequence }) {
     }
   }
 
-  const setDraft = (id: string, d: Draft | undefined) =>
+  const setDraft = (id: string, d: Draft | undefined, onlyIf?: Draft) =>
     setDrafts((prev) => {
+      if (!d && onlyIf && prev[id] !== onlyIf) return prev
       const next = { ...prev }
       if (d) next[id] = d
       else delete next[id]
@@ -246,7 +302,7 @@ export function SequenceSteps({ sequence }: { sequence: Sequence }) {
   const addMenu = (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline">
+        <Button variant="outline" disabled={addStep.isPending}>
           <PlusIcon /> Add step
         </Button>
       </DropdownMenuTrigger>
@@ -267,7 +323,11 @@ export function SequenceSteps({ sequence }: { sequence: Sequence }) {
     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_22rem]">
       <div className="space-y-4">
         {sequence.steps.length === 0 ? (
-          <EmptyState title="No steps yet" description="Add an email, LinkedIn touch or call task to get started." action={addMenu} />
+          <EmptyState
+            title="No steps yet"
+            description={readOnly ? "This sequence has no steps." : "Add an email, LinkedIn touch or call task to get started."}
+            action={readOnly ? undefined : addMenu}
+          />
         ) : (
           <ol className="relative space-y-4">
             {sequence.steps.map((step, i) => (
@@ -286,16 +346,19 @@ export function SequenceSteps({ sequence }: { sequence: Sequence }) {
                     total={sequence.steps.length}
                     selected={step.id === previewStep?.id}
                     draft={drafts[step.id]}
+                    readOnly={readOnly}
                     onSelect={() => setPreviewStepId(step.id)}
-                    onDraft={(d) => setDraft(step.id, d)}
+                    onDraft={(d, onlyIf) => setDraft(step.id, d, onlyIf)}
                   />
                 </div>
               </li>
             ))}
-            <li className="flex gap-3 sm:gap-4">
-              <div className="w-12 shrink-0" />
-              {addMenu}
-            </li>
+            {!readOnly && (
+              <li className="flex gap-3 sm:gap-4">
+                <div className="w-12 shrink-0" />
+                {addMenu}
+              </li>
+            )}
           </ol>
         )}
       </div>
@@ -337,7 +400,8 @@ export function SequenceSteps({ sequence }: { sequence: Sequence }) {
                 <SelectContent>
                   {sampleContacts.map((c) => (
                     <SelectItem key={c.id} value={c.id}>
-                      {fullName(c)} · {lookup.account(c.accountId)?.name}
+                      {fullName(c)}
+                      {c.accountName ? ` · ${c.accountName}` : ""}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -346,7 +410,7 @@ export function SequenceSteps({ sequence }: { sequence: Sequence }) {
                 <div className="space-y-1 p-3 text-xs">
                   <div className="flex gap-2">
                     <span className="w-10 text-muted-foreground">From</span>
-                    <span className="truncate">{owner?.name ?? "Sender"}</span>
+                    <span className="truncate">{ownerName ?? "Sender"}</span>
                   </div>
                   <div className="flex gap-2">
                     <span className="w-10 text-muted-foreground">To</span>

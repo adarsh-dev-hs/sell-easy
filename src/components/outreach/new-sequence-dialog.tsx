@@ -3,7 +3,6 @@
 import { useState } from "react"
 import { useRouter } from "next/navigation"
 import { PlusIcon } from "lucide-react"
-import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import {
@@ -20,14 +19,15 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { StatusBadge } from "@/components/shared/status"
-import { useStore } from "@/lib/store"
+import { useCreateSequence, useCurrentUser, useMailboxes, useUsers } from "@/lib/api"
 
 export function NewSequenceDialog() {
   const router = useRouter()
-  const users = useStore((s) => s.users)
-  const mailboxes = useStore((s) => s.mailboxes)
-  const currentUserId = useStore((s) => s.currentUserId)
-  const addSequence = useStore((s) => s.addSequence)
+  const users = useUsers().data ?? []
+  const mailboxesQuery = useMailboxes()
+  const mailboxes = mailboxesQuery.data ?? []
+  const currentUserId = useCurrentUser().id
+  const createSequence = useCreateSequence()
 
   const [open, setOpen] = useState(false)
   const [name, setName] = useState("")
@@ -42,12 +42,17 @@ export function NewSequenceDialog() {
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!name.trim()) return
-    const id = addSequence({ name: name.trim(), ownerId: ownerId || currentUserId, mailboxIds })
-    toast.success("Sequence created", { description: name.trim() })
-    setOpen(false)
-    reset()
-    router.push(`/outreach/${id}`)
+    if (!name.trim() || createSequence.isPending) return
+    createSequence.mutate(
+      { name: name.trim(), ownerId: ownerId || currentUserId, mailboxIds },
+      {
+        onSuccess: (seq) => {
+          setOpen(false)
+          reset()
+          router.push(`/outreach/${seq.id}`)
+        },
+      },
+    )
   }
 
   return (
@@ -102,7 +107,8 @@ export function NewSequenceDialog() {
               <FieldLabel>Sending mailboxes</FieldLabel>
               <FieldDescription>Emails rotate across the selected mailboxes.</FieldDescription>
               <div className="space-y-1 rounded-lg border p-2">
-                {mailboxes.length === 0 && <p className="p-2 text-sm text-muted-foreground">No mailboxes connected yet.</p>}
+                {mailboxesQuery.isPending && <p className="p-2 text-sm text-muted-foreground">Loading mailboxes…</p>}
+                {mailboxesQuery.isSuccess && mailboxes.length === 0 && <p className="p-2 text-sm text-muted-foreground">No mailboxes connected yet.</p>}
                 {mailboxes.map((m) => {
                   const checked = mailboxIds.includes(m.id)
                   return (
@@ -128,8 +134,8 @@ export function NewSequenceDialog() {
             <Button type="button" variant="outline" onClick={() => setOpen(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!name.trim()}>
-              Create sequence
+            <Button type="submit" disabled={!name.trim() || createSequence.isPending}>
+              {createSequence.isPending ? "Creating…" : "Create sequence"}
             </Button>
           </DialogFooter>
         </form>

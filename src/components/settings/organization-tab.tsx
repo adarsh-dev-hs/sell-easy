@@ -2,9 +2,10 @@
 
 import { useState } from "react"
 import { useRouter } from "next/navigation"
-import { CheckIcon, LockIcon, LogOutIcon, RotateCcwIcon, SparklesIcon } from "lucide-react"
+import { useQueryClient } from "@tanstack/react-query"
+import { CheckIcon, DatabaseIcon, Loader2Icon, LockIcon, LogOutIcon, RotateCcwIcon, SparklesIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
-import { ConfirmDialog } from "@/components/shared/confirm-dialog"
+import { QueryError } from "@/components/shared/query-state"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -14,10 +15,22 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/c
 import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { useCurrentUser, useStore } from "@/lib/store"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  api,
+  isAdmin,
+  type OrgWithSeats,
+  useAuthStore,
+  useChangePlan,
+  useCurrentUser,
+  useMeta,
+  useOrg,
+  useResetWorkspace,
+  useUpdateOrg,
+  useUsers,
+} from "@/lib/api"
 import type { Organization } from "@/lib/types"
 import { cn } from "@/lib/utils"
-import { canManageOrg } from "./shared"
 
 const TIMEZONES = [
   "America/Los_Angeles",
@@ -35,18 +48,29 @@ const TIMEZONES = [
   "UTC",
 ]
 
-export const PLANS: { id: Organization["plan"]; name: string; price: string; seats: number; features: string[] }[] = [
-  { id: "starter", name: "Starter", price: "$99/mo", seats: 3, features: ["3 seats", "2,500 enrichment credits", "1 active sequence", "Email support"] },
-  { id: "growth", name: "Growth", price: "$499/mo", seats: 10, features: ["10 seats", "25,000 enrichment credits", "Orchestration agent", "CRM write-back"] },
-  { id: "enterprise", name: "Enterprise", price: "Custom", seats: 50, features: ["50 seats", "Unlimited credits", "SSO & audit log", "Dedicated CSM"] },
+/** Marketing copy only — seat counts come from the API (`meta.planSeats`). */
+const PLANS: { id: Organization["plan"]; name: string; price: string; features: string[] }[] = [
+  { id: "starter", name: "Starter", price: "$99/mo", features: ["2,500 enrichment credits", "1 active sequence", "Email support"] },
+  { id: "growth", name: "Growth", price: "$499/mo", features: ["25,000 enrichment credits", "Orchestration agent", "CRM write-back"] },
+  { id: "enterprise", name: "Enterprise", price: "Custom", features: ["Unlimited credits", "SSO & audit log", "Dedicated CSM"] },
 ]
 
 const DOMAIN_RE = /^(?!-)[a-z0-9-]+(\.[a-z0-9-]+)+$/i
 
 export function OrganizationTab() {
-  const org = useStore((s) => s.org)
+  const orgQuery = useOrg()
   const user = useCurrentUser()
-  const canEdit = canManageOrg(user?.role)
+  const canEdit = isAdmin(user.role)
+  const org = orgQuery.data
+  if (orgQuery.isError) return <QueryError error={orgQuery.error} onRetry={() => orgQuery.refetch()} />
+  if (!org) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-64 rounded-xl" />
+        <Skeleton className="h-36 rounded-xl" />
+      </div>
+    )
+  }
   return (
     <div className="space-y-6">
       {!canEdit && (
@@ -57,14 +81,14 @@ export function OrganizationTab() {
         </Alert>
       )}
       <OrgForm key={`${org.name}|${org.domain}|${org.timezone}`} org={org} canEdit={canEdit} />
-      <PlanCard canEdit={canEdit} />
-      <DangerZone canEdit={canEdit} />
+      <PlanCard org={org} canChange={user.role === "owner"} />
+      <DangerZone canReset={user.role === "owner"} />
     </div>
   )
 }
 
 function OrgForm({ org, canEdit }: { org: Organization; canEdit: boolean }) {
-  const updateOrg = useStore((s) => s.updateOrg)
+  const updateOrg = useUpdateOrg()
   const [name, setName] = useState(org.name)
   const [domain, setDomain] = useState(org.domain)
   const [timezone, setTimezone] = useState(org.timezone)
@@ -82,8 +106,7 @@ function OrgForm({ org, canEdit }: { org: Organization; canEdit: boolean }) {
     if (!canEdit) return
     setSubmitted(true)
     if (errors.name || errors.domain) return
-    updateOrg({ name: name.trim(), domain: domain.trim().toLowerCase(), timezone })
-    toast.success("Organization updated")
+    updateOrg.mutate({ name: name.trim(), domain: domain.trim().toLowerCase(), timezone }, { onSuccess: () => setSubmitted(false) })
   }
 
   return (
@@ -131,7 +154,7 @@ function OrgForm({ org, canEdit }: { org: Organization; canEdit: boolean }) {
           <Button
             type="button"
             variant="ghost"
-            disabled={!canEdit || !dirty}
+            disabled={!canEdit || !dirty || updateOrg.isPending}
             onClick={() => {
               setName(org.name)
               setDomain(org.domain)
@@ -141,7 +164,8 @@ function OrgForm({ org, canEdit }: { org: Organization; canEdit: boolean }) {
           >
             Discard
           </Button>
-          <Button type="submit" disabled={!canEdit || !dirty}>
+          <Button type="submit" disabled={!canEdit || !dirty || updateOrg.isPending}>
+            {updateOrg.isPending && <Loader2Icon className="animate-spin" />}
             Save changes
           </Button>
         </CardFooter>
@@ -150,33 +174,25 @@ function OrgForm({ org, canEdit }: { org: Organization; canEdit: boolean }) {
   )
 }
 
-function PlanCard({ canEdit }: { canEdit: boolean }) {
-  const org = useStore((s) => s.org)
-  const users = useStore((s) => s.users)
-  const updateOrg = useStore((s) => s.updateOrg)
+function PlanCard({ org, canChange }: { org: OrgWithSeats; canChange: boolean }) {
+  const users = useUsers()
+  const meta = useMeta()
+  const changePlan = useChangePlan()
   const [open, setOpen] = useState(false)
 
-  const active = users.filter((u) => u.status === "active").length
-  const invited = users.filter((u) => u.status === "invited").length
-  const used = active + invited
+  const used = org.seatsUsed
+  const active = users.data?.filter((u) => u.status === "active").length
+  const invited = users.data?.filter((u) => u.status === "invited").length
   const pct = org.seats > 0 ? Math.min(100, (used / org.seats) * 100) : 100
   const plan = PLANS.find((p) => p.id === org.plan) ?? PLANS[0]
+  const seatsFor = (id: Organization["plan"]) => meta.data?.planSeats[id] ?? (id === org.plan ? org.seats : undefined)
 
   const choose = (id: Organization["plan"]) => {
-    const target = PLANS.find((p) => p.id === id)!
     if (id === org.plan) {
       setOpen(false)
       return
     }
-    if (target.seats < used) {
-      toast.error(`${target.name} includes ${target.seats} seats`, {
-        description: `You're using ${used}. Remove members before downgrading.`,
-      })
-      return
-    }
-    updateOrg({ plan: id, seats: target.seats })
-    toast.success(`Switched to ${target.name}`, { description: `${target.seats} seats available.` })
-    setOpen(false)
+    changePlan.mutate(id, { onSuccess: () => setOpen(false) })
   }
 
   return (
@@ -186,10 +202,15 @@ function PlanCard({ canEdit }: { canEdit: boolean }) {
           Plan <Badge>{plan.name}</Badge>
         </CardTitle>
         <CardDescription>
-          {plan.price} · {plan.features.slice(1).join(" · ")}
+          {plan.price} · {plan.features.join(" · ")}
         </CardDescription>
         <CardAction>
-          <Button size="sm" onClick={() => setOpen(true)} disabled={!canEdit}>
+          <Button
+            size="sm"
+            onClick={() => setOpen(true)}
+            disabled={!canChange}
+            title={canChange ? undefined : "Only the workspace owner can change the plan"}
+          >
             <SparklesIcon /> {org.plan === "enterprise" ? "Change plan" : "Upgrade plan"}
           </Button>
         </CardAction>
@@ -202,9 +223,11 @@ function PlanCard({ canEdit }: { canEdit: boolean }) {
           </span>
         </div>
         <Progress value={pct} className={cn("h-2", pct >= 100 && "[&>[data-slot=progress-indicator]]:bg-destructive")} />
-        <p className="text-xs text-muted-foreground">
-          {active} active · {invited} pending invite{invited === 1 ? "" : "s"}
-        </p>
+        {active !== undefined && invited !== undefined && (
+          <p className="text-xs text-muted-foreground">
+            {active} active · {invited} pending invite{invited === 1 ? "" : "s"}
+          </p>
+        )}
       </CardContent>
 
       <Dialog open={open} onOpenChange={setOpen}>
@@ -216,7 +239,9 @@ function PlanCard({ canEdit }: { canEdit: boolean }) {
           <div className="grid gap-3 sm:grid-cols-3">
             {PLANS.map((p) => {
               const current = p.id === org.plan
-              const tooSmall = p.seats < used
+              const seats = seatsFor(p.id)
+              const tooSmall = seats !== undefined && seats < used
+              const pending = changePlan.isPending && changePlan.variables === p.id
               return (
                 <div key={p.id} className={cn("flex flex-col gap-3 rounded-xl border p-4", current && "border-primary ring-1 ring-primary")}>
                   <div className="flex items-center justify-between">
@@ -225,13 +250,18 @@ function PlanCard({ canEdit }: { canEdit: boolean }) {
                   </div>
                   <div className="text-2xl font-semibold tracking-tight">{p.price}</div>
                   <ul className="flex-1 space-y-1.5 text-sm text-muted-foreground">
-                    {p.features.map((f) => (
+                    {[seats !== undefined ? `${seats} seats` : "Seats loading…", ...p.features].map((f) => (
                       <li key={f} className="flex items-center gap-2">
                         <CheckIcon className="size-3.5 text-primary" /> {f}
                       </li>
                     ))}
                   </ul>
-                  <Button variant={current ? "outline" : "default"} disabled={current || tooSmall} onClick={() => choose(p.id)}>
+                  <Button
+                    variant={current ? "outline" : "default"}
+                    disabled={current || tooSmall || changePlan.isPending}
+                    onClick={() => choose(p.id)}
+                  >
+                    {pending && <Loader2Icon className="animate-spin" />}
                     {current ? "Current plan" : tooSmall ? "Too few seats" : `Select ${p.name}`}
                   </Button>
                 </div>
@@ -239,7 +269,7 @@ function PlanCard({ canEdit }: { canEdit: boolean }) {
             })}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
+            <Button variant="outline" onClick={() => setOpen(false)} disabled={changePlan.isPending}>
               Cancel
             </Button>
           </DialogFooter>
@@ -249,10 +279,24 @@ function PlanCard({ canEdit }: { canEdit: boolean }) {
   )
 }
 
-function DangerZone({ canEdit }: { canEdit: boolean }) {
+function DangerZone({ canReset }: { canReset: boolean }) {
   const router = useRouter()
-  const resetDemo = useStore((s) => s.resetDemo)
-  const logout = useStore((s) => s.logout)
+  const qc = useQueryClient()
+  const clearSession = useAuthStore((s) => s.clear)
+  const meta = useMeta()
+  const reset = useResetWorkspace()
+  const [resetOpen, setResetOpen] = useState(false)
+  const showReset = canReset && meta.data?.features.adminReset === true
+
+  const logout = () => {
+    void api.post("/auth/logout").catch(() => undefined)
+    clearSession()
+    qc.clear()
+    toast.success("Logged out")
+    router.replace("/login")
+  }
+
+  const runReset = (demo: boolean) => reset.mutate({ demo }, { onSuccess: () => setResetOpen(false) })
 
   return (
     <Card className="ring-destructive/30">
@@ -261,43 +305,56 @@ function DangerZone({ canEdit }: { canEdit: boolean }) {
         <CardDescription>These actions can&apos;t be undone.</CardDescription>
       </CardHeader>
       <CardContent className="divide-y">
-        <div className="flex flex-col gap-3 pb-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <div className="font-medium">Reset demo data</div>
-            <p className="text-sm text-muted-foreground">Restore all accounts, signals, sequences and settings to the original seed.</p>
+        {showReset && (
+          <div className="flex flex-col gap-3 pb-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="font-medium">Reset workspace</div>
+              <p className="text-sm text-muted-foreground">
+                Wipe accounts, signals, sequences, deals and settings. Team members and API keys are kept.
+              </p>
+            </div>
+            <Button variant="destructive" onClick={() => setResetOpen(true)}>
+              <RotateCcwIcon /> Reset workspace
+            </Button>
           </div>
-          <ConfirmDialog
-            title="Reset all demo data?"
-            description="Every change you've made — accounts, deals, integrations, team and settings — will be replaced with fresh seed data."
-            confirmLabel="Reset data"
-            onConfirm={() => {
-              resetDemo()
-              toast.success("Demo data reset")
-            }}
-            trigger={
-              <Button variant="destructive" disabled={!canEdit}>
-                <RotateCcwIcon /> Reset demo data
-              </Button>
-            }
-          />
-        </div>
-        <div className="flex flex-col gap-3 pt-4 sm:flex-row sm:items-center sm:justify-between">
+        )}
+        <div className={cn("flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between", showReset && "pt-4")}>
           <div>
             <div className="font-medium">Log out</div>
             <p className="text-sm text-muted-foreground">End your session on this device.</p>
           </div>
-          <Button
-            variant="outline"
-            onClick={() => {
-              logout()
-              toast.success("Logged out")
-              router.replace("/login")
-            }}
-          >
+          <Button variant="outline" onClick={logout}>
             <LogOutIcon /> Log out
           </Button>
         </div>
       </CardContent>
+
+      <Dialog open={resetOpen} onOpenChange={(o) => !reset.isPending && setResetOpen(o)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Reset workspace?</DialogTitle>
+            <DialogDescription>
+              Every account, contact, signal, sequence, deal and integration setting in this workspace will be deleted. Team members and API
+              keys are kept.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-2">
+            <Button variant="destructive" disabled={reset.isPending} onClick={() => runReset(false)}>
+              {reset.isPending && reset.variables?.demo === false ? <Loader2Icon className="animate-spin" /> : <Trash2Icon />}
+              Clear all data
+            </Button>
+            <Button variant="outline" disabled={reset.isPending} onClick={() => runReset(true)}>
+              {reset.isPending && reset.variables?.demo === true ? <Loader2Icon className="animate-spin" /> : <DatabaseIcon />}
+              Load demo data
+            </Button>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" disabled={reset.isPending} onClick={() => setResetOpen(false)}>
+              Cancel
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   )
 }

@@ -1,4 +1,4 @@
-import type { Integration, IntegrationCategory } from "@/lib/types"
+import type { IntegrationCategory } from "@/lib/types"
 
 export type ConfigField =
   | { key: string; label: string; description?: string; type: "switch"; default: boolean }
@@ -6,9 +6,9 @@ export type ConfigField =
   | { key: string; label: string; description?: string; type: "number"; default: string; min?: number; suffix?: string }
 
 export const SYNC_INTERVALS = [
-  { value: "15min", label: "Every 15 minutes", ms: 15 * 60_000 },
-  { value: "hourly", label: "Hourly", ms: 60 * 60_000 },
-  { value: "daily", label: "Daily", ms: 24 * 60 * 60_000 },
+  { value: "15min", label: "Every 15 minutes" },
+  { value: "hourly", label: "Hourly" },
+  { value: "daily", label: "Daily" },
 ]
 
 export const LLM_MODELS = [
@@ -77,12 +77,4 @@ export const TILE_COLORS: Record<IntegrationCategory, string> = {
   calls: "bg-rose-500/15 text-rose-700 dark:text-rose-300",
   crm: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
   llm: "bg-stone-500/15 text-stone-700 dark:text-stone-300",
-}
-
-export const isWaterfallCandidate = (i: Integration) =>
-  i.connected && (i.category === "enrichment" || i.category === "contacts") && i.settings.useInWaterfall !== false
-
-export const waterfallRank = (i: Integration) => {
-  const n = Number(i.settings.waterfallOrder)
-  return Number.isFinite(n) && i.settings.waterfallOrder !== undefined ? n : 999
 }

@@ -4,7 +4,7 @@ import Link from "next/link"
 import { CheckIcon, ClockIcon, MinusIcon, XIcon } from "lucide-react"
 import { StatusBadge } from "@/components/shared/status"
 import { dateTime } from "@/lib/format"
-import type { AgentRun, AgentStep, PlaybookRule } from "@/lib/types"
+import type { AgentRun, AgentStep } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 const STEP_STYLES: Record<AgentStep["status"], { icon: typeof CheckIcon; className: string }> = {
@@ -64,13 +64,22 @@ export function ScoreDelta({ before, after }: { before?: number; after?: number 
 export const formatDuration = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`)
 
 /** Compact summary block for a run: header line + timeline. */
-export function RunSummary({ run, rule, accountName }: { run: AgentRun; rule?: PlaybookRule; accountName?: string }) {
+export function RunSummary({
+  run,
+  ruleName,
+  accountName,
+}: {
+  run: AgentRun
+  /** Playbook name (`AgentRunRecord.ruleName`); falls back to a generic label. */
+  ruleName?: string | null
+  accountName?: string
+}) {
   return (
     <div className="space-y-3 rounded-lg border p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
           <Link href={`/agent?run=${run.id}`} className="text-sm font-medium hover:underline">
-            {rule?.name ?? "No playbook matched"}
+            {ruleName ?? (run.ruleId ? "Deleted playbook" : "No playbook matched")}
           </Link>
           <div className="text-xs text-muted-foreground">
             {accountName ? `${accountName} · ` : ""}

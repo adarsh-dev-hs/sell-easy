@@ -11,12 +11,13 @@ import { OrganizationTab } from "@/components/settings/organization-tab"
 import { ProfileTab } from "@/components/settings/profile-tab"
 import { TeamTab } from "@/components/settings/team-tab"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { isAdmin, useCurrentUser } from "@/lib/api"
 
 const TABS = [
   { value: "profile", label: "Profile", icon: UserIcon, Component: ProfileTab },
   { value: "organization", label: "Organization", icon: Building2Icon, Component: OrganizationTab },
   { value: "team", label: "Team", icon: UsersIcon, Component: TeamTab },
-  { value: "api-keys", label: "API keys", icon: KeyRoundIcon, Component: ApiKeysTab },
+  { value: "api-keys", label: "API keys", icon: KeyRoundIcon, Component: ApiKeysTab, adminOnly: true },
   { value: "notifications", label: "Notifications", icon: BellIcon, Component: NotificationsTab },
   { value: "appearance", label: "Appearance", icon: PaletteIcon, Component: AppearanceTab },
 ] as const
@@ -27,8 +28,10 @@ function SettingsInner() {
   const router = useRouter()
   const pathname = usePathname()
   const searchParams = useSearchParams()
+  const user = useCurrentUser()
+  const tabs = TABS.filter((t) => !("adminOnly" in t && t.adminOnly) || isAdmin(user.role))
   const param = searchParams.get("tab")
-  const tab: TabValue = TABS.some((t) => t.value === param) ? (param as TabValue) : "profile"
+  const tab: TabValue = tabs.some((t) => t.value === param) ? (param as TabValue) : "profile"
 
   const onTabChange = (value: string) => {
     const params = new URLSearchParams(searchParams.toString())
@@ -44,14 +47,14 @@ function SettingsInner() {
       <Tabs value={tab} onValueChange={onTabChange} className="gap-6">
         <div className="-mx-1 overflow-x-auto px-1 pb-1">
           <TabsList>
-            {TABS.map((t) => (
+            {tabs.map((t) => (
               <TabsTrigger key={t.value} value={t.value} className="px-2.5">
                 <t.icon /> {t.label}
               </TabsTrigger>
             ))}
           </TabsList>
         </div>
-        {TABS.map((t) => (
+        {tabs.map((t) => (
           <TabsContent key={t.value} value={t.value} className="max-w-5xl">
             <t.Component />
           </TabsContent>
